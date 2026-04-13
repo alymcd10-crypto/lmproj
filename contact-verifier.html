@@ -353,9 +353,9 @@ async function fetchGravatar(email) {
   try {
     const hash = await sha256hex(email.toLowerCase().trim());
     // d=404 makes Gravatar return HTTP 404 when no avatar exists (so we know it's real)
-    const testUrl = `https://www.gravatar.com/avatar/${hash}?d=404&s=200&r=g`;
+    const testUrl = `https://www.gravatar.com/avatar/${hash}?d=404&s=200&r=pg`;
     const resp = await fetch(testUrl, { signal: AbortSignal.timeout(5000) });
-    if (resp.ok) return `https://www.gravatar.com/avatar/${hash}?s=200&r=g`;
+    if (resp.ok) return `https://www.gravatar.com/avatar/${hash}?s=200&r=pg`;
   } catch {}
   return null;
 }
@@ -540,7 +540,9 @@ async function verifyContact(contact, apiConfig = {}, onStage = null) {
       const es = extractEmails(text).filter(e=>!GENERIC_EMAIL_PREFIXES.test(e));
       if (ps.length && !webData.phone) webData.phone = ps[0];
       if (es.length && !webData.email) webData.email = es[0];
-      if (ps.length || es.length) results.webSources.push("Company Website");
+      if ((ps.length || es.length) && !results.webSources.includes("Company Website")) {
+        results.webSources.push("Company Website");
+      }
     }
     // Also try /contact, /about, /team pages if no data yet
     if (!webData.phone && !webData.email) {
@@ -552,8 +554,11 @@ async function verifyContact(contact, apiConfig = {}, onStage = null) {
           const t2 = html2.replace(/<[^>]+>/g," ").replace(/\s+/g," ");
           const ps2 = extractPhones(t2);
           const es2 = extractEmails(t2).filter(e=>!GENERIC_EMAIL_PREFIXES.test(e));
-          if (ps2.length && !webData.phone) { webData.phone = ps2[0]; results.webSources.push("Company Website"); }
-          if (es2.length && !webData.email) { webData.email = es2[0]; results.webSources.push("Company Website"); }
+          if (ps2.length && !webData.phone) webData.phone = ps2[0];
+          if (es2.length && !webData.email) webData.email = es2[0];
+          if ((ps2.length || es2.length) && !results.webSources.includes("Company Website")) {
+            results.webSources.push("Company Website");
+          }
           if (webData.phone || webData.email) break;
         } catch {}
       }
@@ -732,12 +737,18 @@ function exportCSV(contacts) {
     const v = c.verification || {};
     const wf = v.webFound || {};
     // Compute match fields
+    const recEmailNorm = (c.email||"").toLowerCase().trim();
+    const webEmailNorm = (wf.email||"").toLowerCase().trim();
+    const recEmailDomain = recEmailNorm.includes("@") ? recEmailNorm.split("@")[1] : null;
+    const webEmailDomain = webEmailNorm.includes("@") ? webEmailNorm.split("@")[1] : null;
     const emailMatch = wf.email
-      ? ((c.email||"").toLowerCase().trim() === (wf.email||"").toLowerCase().trim() ? "yes"
-        : (c.email||"").split("@")[1] === (wf.email||"").split("@")[1] ? "different-alias" : "different")
+      ? (recEmailNorm === webEmailNorm ? "yes"
+        : (recEmailDomain && webEmailDomain && recEmailDomain === webEmailDomain) ? "different-alias" : "different")
       : "";
+    const recPhoneNorm = normalizePhone(c.phone||"").replace(/^\+1/,"");
+    const webPhoneNorm = normalizePhone(wf.phone||"").replace(/^\+1/,"");
     const phoneMatch = wf.phone
-      ? (normalizePhone(c.phone||"").replace(/^\+1/,"") === normalizePhone(wf.phone||"").replace(/^\+1/,"") ? "yes" : "different")
+      ? (recPhoneNorm && webPhoneNorm && recPhoneNorm === webPhoneNorm ? "yes" : "different")
       : "";
     const companyMatch = wf.companyChanged ? "changed" : (wf.company ? (wf.company === c.company ? "yes" : "check") : "");
     const row = [
