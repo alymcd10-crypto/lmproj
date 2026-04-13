@@ -1,0 +1,1262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="theme-color" content="#faf8f5">
+  <title>Daily Habits</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=Sora:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+
+  <!-- Firebase SDK (compat) -->
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
+
+  <!-- React + Babel -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <style>
+    *  { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+    html,body { height:100%; }
+    body { font-family:'Sora',sans-serif; background:#faf8f5; color:#3d3830; min-height:100vh; overscroll-behavior:none; }
+    #root { min-height:100vh; }
+    input,button,select { font-family:'Sora',sans-serif; }
+    input:focus { outline:none; border-color:#8a7060 !important; }
+
+    @keyframes dh-si   { from{opacity:0;transform:translateY(14px)} to{opacity:1;transform:translateY(0)} }
+    @keyframes dh-cpop { from{transform:scale(.85);opacity:0}         to{transform:scale(1);opacity:1} }
+    @keyframes dh-shake{ 0%,100%{transform:translateX(0)} 20%,60%{transform:translateX(-5px)} 40%,80%{transform:translateX(5px)} }
+    @keyframes dh-spin  { to{transform:rotate(360deg)} }
+
+    .dh-si    { animation:dh-si    .38s cubic-bezier(.16,1,.3,1) both; }
+    .dh-cpop  { animation:dh-cpop  .3s  cubic-bezier(.16,1,.3,1) both; }
+    .dh-shake { animation:dh-shake .38s ease; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useCallback, useContext, createContext,
+        useMemo, useRef, memo } = React;
+
+// ════════════════════════════════════════════════════════
+// CONSTANTS & PURE UTILITIES
+// ════════════════════════════════════════════════════════
+const SERIF = "'DM Serif Display',Georgia,serif";
+const SANS  = "'Sora',sans-serif";
+const SCHEMA_VERSION = 2;   // bump when data shape changes
+const POINTS_PER     = 10;
+const POINTS_BONUS   = 25;
+
+const dayKey = () => new Date().toISOString().slice(0,10);
+
+// Strip chars illegal in Firebase Realtime DB keys: . $ # [ ] /
+function toKey(str) {
+  return String(str).trim().slice(0,50).replace(/[.$#[\]/\s]/g,'_');
+}
+function sanitize(str, max=200) {
+  return String(str).trim().slice(0,max).replace(/[.$#[\]/]/g,'_');
+}
+const calcPct = (d,t) => t===0 ? 0 : Math.round((d/t)*100);
+const mkId    = () => (crypto.randomUUID ? crypto.randomUUID()
+                        : `${Date.now()}-${Math.random().toString(36).slice(2)}`);
+
+function debounce(fn, ms) {
+  let t;
+  const d = (...a) => { clearTimeout(t); t = setTimeout(()=>fn(...a), ms); };
+  d.cancel = () => clearTimeout(t);
+  return d;
+}
+
+function authErrMsg(code) {
+  const map = {
+    'auth/user-not-found':         'No account found with that email.',
+    'auth/wrong-password':         'Incorrect password — try again.',
+    'auth/invalid-credential':     'Incorrect email or password.',
+    'auth/email-already-in-use':   'An account with this email already exists.',
+    'auth/weak-password':          'Password must be at least 6 characters.',
+    'auth/invalid-email':          'Please enter a valid email address.',
+    'auth/too-many-requests':      'Too many attempts — please wait a moment.',
+    'auth/popup-closed-by-user':   'Sign-in window was closed.',
+    'auth/network-request-failed': 'Network error — check your connection.',
+  };
+  return map[code] || 'Something went wrong. Please try again.';
+}
+
+// Schema migration — add new cases here as schema evolves
+function migrateData(raw) {
+  const version = raw.schemaVersion || 0;
+  const data = { ...raw };
+  // v0→v1: pre-versioning era, no structural changes needed
+  // v1→v2: moved to auth-based familyId; no data changes
+  data.schemaVersion = SCHEMA_VERSION;
+  return data;
+}
+
+function getFlatHabits(name, members, kidHabits, parentHabits, rotation) {
+  const m = members.find(x => x.name === name);
+  if (!m) return [];
+  if (m.role === 'parent') return parentHabits;
+  const base = [...kidHabits];
+  const children = members.filter(x => x.role === 'child');
+  const idx = children.findIndex(x => x.name === name);
+  const chore = rotation.length > 0
+    ? rotation[(idx + new Date().getDay()) % rotation.length]
+    : null;
+  if (chore) return [...base, { id:`rot-${chore.id}`, label:chore.label, category:'Chore' }];
+  return base;
+}
+
+function burst() {
+  if (window.matchMedia('(prefers-reduced-motion:reduce)').matches) return;
+  let c = document.getElementById('dh-confetti');
+  if (!c) {
+    c = document.createElement('div');
+    c.id = 'dh-confetti';
+    c.setAttribute('aria-hidden','true');
+    Object.assign(c.style,{position:'fixed',top:0,left:0,width:'100%',height:'100%',pointerEvents:'none',zIndex:9999});
+    document.body.appendChild(c);
+  }
+  const colors = ['#c4856a','#7d9e7e','#6b8fa8','#c4a24e','#a87b9b','#8a7060'];
+  for (let i=0; i<40; i++) {
+    const dot = document.createElement('div');
+    const size = 6+Math.random()*8, ang = (i/40)*Math.PI*2;
+    const dist = 80+Math.random()*120, dur = 600+Math.random()*400;
+    Object.assign(dot.style,{
+      position:'absolute', width:`${size}px`, height:`${size}px`,
+      borderRadius: Math.random()>.5?'50%':'2px',
+      background: colors[Math.floor(Math.random()*colors.length)],
+      left:'50%', top:'38%', transform:'translate(-50%,-50%)',
+      opacity:'1', transition:`all ${dur}ms cubic-bezier(.15,.9,.3,1)`
+    });
+    c.appendChild(dot);
+    requestAnimationFrame(()=>{
+      dot.style.transform = `translate(${Math.cos(ang)*dist}px,${Math.sin(ang)*dist}px) rotate(${Math.random()*360}deg) scale(0)`;
+      dot.style.opacity = '0';
+    });
+  }
+  setTimeout(()=>c&&c.remove(), 1200);
+}
+
+// ════════════════════════════════════════════════════════
+// DEFAULT DATA
+// ════════════════════════════════════════════════════════
+const COLORS = [
+  {color:'#c4856a',bg:'#8a5c48'},{color:'#7d9e7e',bg:'#4a7a4c'},
+  {color:'#6b8fa8',bg:'#3a6a8a'},{color:'#c4a24e',bg:'#8a7030'},
+  {color:'#a87b9b',bg:'#7a4a72'},{color:'#8a7060',bg:'#5a4535'},
+  {color:'#7a8ea8',bg:'#4a607a'},{color:'#b89060',bg:'#8a6535'},
+];
+const DEFAULT_MEMBERS = [
+  {id:mkId(),name:'Parent',role:'parent',colorIdx:3,initial:'P'},
+  {id:mkId(),name:'Child 1',role:'child',colorIdx:0,initial:'C'},
+];
+const DEFAULT_KID_HABITS = [
+  {id:mkId(),label:'Make bed',        category:'Morning'},
+  {id:mkId(),label:'Brush teeth',     category:'Morning'},
+  {id:mkId(),label:'Get dressed',     category:'Morning'},
+  {id:mkId(),label:'Eat breakfast',   category:'Morning'},
+  {id:mkId(),label:'Pack backpack',   category:'Morning'},
+  {id:mkId(),label:'Read 20 min',     category:'After School'},
+  {id:mkId(),label:'Homework',        category:'After School'},
+  {id:mkId(),label:'Brush teeth (PM)',category:'Evening'},
+];
+const DEFAULT_PARENT_HABITS = [
+  {id:mkId(),label:'Exercise',        category:'Health'},
+  {id:mkId(),label:'Drink water',     category:'Health'},
+  {id:mkId(),label:'Family check-in', category:'Connection'},
+];
+const DEFAULT_ROTATION = [
+  {id:mkId(),label:'Dishes'},
+  {id:mkId(),label:'Clear bathroom counter'},
+  {id:mkId(),label:'Vacuum living room'},
+];
+const SUGGESTIONS = {
+  'Morning':    ['Make bed','Brush teeth','Wash face','Get dressed','Eat breakfast','Pack backpack','Take vitamins','Stretch','Drink water','Open blinds'],
+  'Evening':    ["Brush teeth (PM)","Set out tomorrow's clothes",'Pack bag for tomorrow','Charge phone','Wind-down reading','Gratitude journal','No screens 30 min before bed'],
+  'School':     ['Homework','Read 20 min','Study flash cards','Organize binder',"Review tomorrow's schedule",'Ask for help if stuck','Sign planner'],
+  'Chores':     ['Dishes','Vacuum','Wipe counters','Take out trash','Fold laundry','Put away clothes','Sweep','Clean toilet','Wipe mirrors','Feed pet'],
+  'Health':     ['Exercise','Drink water','Eat a vegetable','Take medication','Go outside','Walk/jog','Stretch','Sleep by 10 PM'],
+  'Exec Function':['Write to-do list','Check assignment tracker','Reply to messages','Set alarms','Review calendar','5-min room tidy','Brain dump worries'],
+  'Connection': ['Family check-in','Text a friend','Call grandparent','Do something kind','Put phone down at dinner'],
+  'Self-Care':  ['Journal','Meditate 5 min','Draw or create','Listen to music mindfully','Practice breathing'],
+  'Social-Emotional':['Name your emotion','Say one thing you\'re proud of','Share a worry','Practice saying no','Do a kind act'],
+};
+
+// ════════════════════════════════════════════════════════
+// SHARED STYLES
+// ════════════════════════════════════════════════════════
+const S = {
+  shell:  {fontFamily:SANS,background:'#faf8f5',minHeight:'100vh',color:'#3d3830'},
+  page:   {maxWidth:540,margin:'0 auto',padding:'24px 20px 100px'},
+  card:   {background:'#fff',border:'1px solid #e8e2d8',borderRadius:20,padding:'20px 18px',marginBottom:14},
+  input:  {width:'100%',border:'1px solid #e0d9cf',borderRadius:12,padding:'12px 14px',fontSize:14,fontFamily:SANS,color:'#3d3830',background:'#faf8f5',outline:'none',transition:'border-color .15s'},
+  btnP:   {width:'100%',background:'#3d3830',color:'#fff',border:'none',borderRadius:14,padding:'14px',fontSize:14,fontWeight:600,fontFamily:SANS,cursor:'pointer',letterSpacing:.3,transition:'opacity .15s'},
+  btnSec: {width:'100%',background:'#fff',color:'#3d3830',border:'1px solid #e0d9cf',borderRadius:14,padding:'13px',fontSize:14,fontFamily:SANS,cursor:'pointer',transition:'background .15s'},
+  label:  {fontSize:11,fontWeight:600,letterSpacing:1.5,color:'#bfb5a2',textTransform:'uppercase',display:'block',marginBottom:6},
+  serif:  (sz,extra={}) => ({fontFamily:SERIF,fontSize:sz,fontWeight:400,...extra}),
+};
+
+// ════════════════════════════════════════════════════════
+// FIREBASE SETUP
+// ════════════════════════════════════════════════════════
+// ⚠️  PASTE YOUR FIREBASE CONFIG OBJECT BELOW  ⚠️
+// Get it from: Firebase Console → Project Settings → Your apps → SDK setup
+const FIREBASE_CONFIG = {
+  apiKey:            "YOUR_API_KEY",
+  authDomain:        "YOUR_AUTH_DOMAIN",
+  databaseURL:       "YOUR_DATABASE_URL",
+  projectId:         "YOUR_PROJECT_ID",
+  storageBucket:     "YOUR_STORAGE_BUCKET",
+  messagingSenderId: "YOUR_MESSAGING_SENDER_ID",
+  appId:             "YOUR_APP_ID",
+};
+
+if (!firebase.apps.length) firebase.initializeApp(FIREBASE_CONFIG);
+const db   = firebase.database();
+const auth = firebase.auth();
+
+// ════════════════════════════════════════════════════════
+// AUTH CONTEXT
+// ════════════════════════════════════════════════════════
+const AuthCtx = createContext(null);
+const useAuth = () => useContext(AuthCtx);
+
+function AuthProvider({ children }) {
+  const [user, setUser] = useState(undefined); // undefined=loading, null=signed out
+  useEffect(() => auth.onAuthStateChanged(u => setUser(u ?? null)), []);
+  return <AuthCtx.Provider value={{ user }}>{children}</AuthCtx.Provider>;
+}
+
+// ════════════════════════════════════════════════════════
+// AUTH SCREEN
+// ════════════════════════════════════════════════════════
+function AuthScreen() {
+  const [mode,       setMode]       = useState('signin'); // signin | signup | reset
+  const [email,      setEmail]      = useState('');
+  const [password,   setPassword]   = useState('');
+  const [loading,    setLoading]    = useState(false);
+  const [msg,        setMsg]        = useState('');
+  const [isErr,      setIsErr]      = useState(false);
+
+  const showErr  = m => { setMsg(m); setIsErr(true); };
+  const showInfo = m => { setMsg(m); setIsErr(false); };
+
+  const handleSubmit = async () => {
+    if (!email.trim()) return showErr('Please enter your email.');
+    if (mode !== 'reset' && password.length < 6) return showErr('Password needs at least 6 characters.');
+    setLoading(true); setMsg('');
+    try {
+      if      (mode==='signin') await auth.signInWithEmailAndPassword(email.trim(), password);
+      else if (mode==='signup') await auth.createUserWithEmailAndPassword(email.trim(), password);
+      else { await auth.sendPasswordResetEmail(email.trim()); showInfo('Reset email sent — check your inbox.'); }
+    } catch(e) { showErr(authErrMsg(e.code)); }
+    setLoading(false);
+  };
+
+  const handleGoogle = async () => {
+    setLoading(true); setMsg('');
+    try { await auth.signInWithPopup(new firebase.auth.GoogleAuthProvider()); }
+    catch(e) { showErr(authErrMsg(e.code)); }
+    setLoading(false);
+  };
+
+  const onKey = e => { if (e.key==='Enter') handleSubmit(); };
+
+  return (
+    <div style={{...S.shell,display:'flex',alignItems:'center',justifyContent:'center',padding:'24px 20px',minHeight:'100vh'}}>
+      <div className="dh-si" style={{width:'100%',maxWidth:380}}>
+
+        {/* Wordmark */}
+        <div style={{textAlign:'center',marginBottom:40}}>
+          <h1 style={{...S.serif(42),color:'#3d3830',lineHeight:1}}>daily habits</h1>
+          <p style={{fontSize:13,color:'#bfb5a2',marginTop:8,letterSpacing:.5}}>your family, every day</p>
+        </div>
+
+        {/* Mode toggle */}
+        {mode !== 'reset' && (
+          <div style={{display:'flex',background:'#f0ebe4',borderRadius:12,padding:3,marginBottom:24}}>
+            {['signin','signup'].map(m => (
+              <button key={m} onClick={()=>{setMode(m);setMsg('');}}
+                style={{flex:1,padding:10,background:mode===m?'#fff':'none',border:'none',borderRadius:10,
+                  fontSize:13,fontWeight:mode===m?600:400,color:mode===m?'#3d3830':'#bfb5a2',
+                  cursor:'pointer',transition:'all .15s',fontFamily:SANS}}>
+                {m==='signin'?'Sign in':'Sign up'}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {mode==='reset' && (
+          <button onClick={()=>{setMode('signin');setMsg('');}}
+            style={{background:'none',border:'none',fontSize:13,color:'#bfb5a2',cursor:'pointer',fontFamily:SANS,marginBottom:20,padding:0}}>
+            ← back to sign in
+          </button>
+        )}
+
+        {/* Email */}
+        <div style={{marginBottom:12}}>
+          <label style={S.label}>email</label>
+          <input type="email" value={email} onChange={e=>setEmail(e.target.value)} onKeyDown={onKey}
+            placeholder="you@email.com" autoComplete="email" style={S.input} aria-label="Email address"/>
+        </div>
+
+        {/* Password */}
+        {mode !== 'reset' && (
+          <div style={{marginBottom:20}}>
+            <label style={S.label}>{mode==='signup'?'create password':'password'}</label>
+            <input type="password" value={password} onChange={e=>setPassword(e.target.value)} onKeyDown={onKey}
+              placeholder="••••••••" autoComplete={mode==='signup'?'new-password':'current-password'}
+              style={S.input} aria-label="Password"/>
+          </div>
+        )}
+
+        {/* Feedback banner */}
+        {msg && (
+          <div role="alert" style={{fontSize:13,marginBottom:16,padding:'10px 14px',borderRadius:10,
+            background:isErr?'#fdf0ee':'#f0f5f0', color:isErr?'#a84444':'#4a7a4c',
+            border:`1px solid ${isErr?'#f0c8c0':'#a5d6a7'}`}}>
+            {msg}
+          </div>
+        )}
+
+        {/* Primary CTA */}
+        <button onClick={handleSubmit} disabled={loading}
+          style={{...S.btnP,opacity:loading?.6:1,marginBottom:12}} aria-busy={loading}>
+          {loading ? '…' : mode==='signin'?'Sign in':mode==='signup'?'Create account':'Send reset email'}
+        </button>
+
+        {/* Google */}
+        {mode !== 'reset' && (
+          <>
+            <div style={{display:'flex',alignItems:'center',gap:10,margin:'14px 0'}}>
+              <div style={{flex:1,height:1,background:'#e8e2d8'}}/>
+              <span style={{fontSize:12,color:'#bfb5a2'}}>or</span>
+              <div style={{flex:1,height:1,background:'#e8e2d8'}}/>
+            </div>
+            <button onClick={handleGoogle} disabled={loading}
+              style={{...S.btnSec,display:'flex',alignItems:'center',justifyContent:'center',gap:10,opacity:loading?.6:1}}
+              aria-label="Continue with Google">
+              <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
+                <path fill="#4285F4" d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844a4.14 4.14 0 0 1-1.796 2.716v2.259h2.908C16.657 14.233 17.64 11.925 17.64 9.2z"/>
+                <path fill="#34A853" d="M9 18c2.43 0 4.467-.806 5.956-2.18l-2.908-2.259c-.806.54-1.837.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.332A8.997 8.997 0 0 0 9 18z"/>
+                <path fill="#FBBC05" d="M3.964 10.71A5.41 5.41 0 0 1 3.682 9c0-.593.102-1.17.282-1.71V4.958H.957A8.996 8.996 0 0 0 0 9c0 1.452.348 2.827.957 4.042l3.007-2.332z"/>
+                <path fill="#EA4335" d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0A8.997 8.997 0 0 0 .957 4.958L3.964 7.29C4.672 5.163 6.656 3.58 9 3.58z"/>
+              </svg>
+              Continue with Google
+            </button>
+          </>
+        )}
+
+        {/* Forgot password */}
+        {mode==='signin' && (
+          <div style={{textAlign:'center',marginTop:18}}>
+            <button onClick={()=>{setMode('reset');setMsg('');}}
+              style={{background:'none',border:'none',fontSize:12,color:'#bfb5a2',cursor:'pointer',fontFamily:SANS}}>
+              Forgot password?
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════
+// DATA CONTEXT  (auth-aware, Firebase-backed)
+// ════════════════════════════════════════════════════════
+const DataCtx  = createContext(null);
+const useData  = () => useContext(DataCtx);
+
+function DataProvider({ user, children }) {
+  const uid  = user.uid;
+  const fRef = useCallback(path => db.ref(`families/${uid}${path?'/'+path:''}`), [uid]);
+
+  const [checksData,   setChecksData]   = useState({});
+  const [pointsData,   setPointsData]   = useState({});
+  const [members,      setMembers]      = useState(DEFAULT_MEMBERS);
+  const [kidHabits,    setKidHabits]    = useState(DEFAULT_KID_HABITS);
+  const [parentHabits, setParentHabits] = useState(DEFAULT_PARENT_HABITS);
+  const [rotation,     setRotation]     = useState(DEFAULT_ROTATION);
+  const [who,          setWho]          = useState(null);
+  const [setupDone,    setSetupDone]    = useState(false);
+  const [parentPin,    setParentPin]    = useState('');
+  const [loaded,       setLoaded]       = useState(false);
+  const [error,        setError]        = useState(null);
+  const [online,       setOnline]       = useState(true);
+  const celebRef = useRef({});
+
+  // ── Online / offline
+  useEffect(() => {
+    const on  = () => setOnline(true);
+    const off = () => setOnline(false);
+    window.addEventListener('online',  on);
+    window.addEventListener('offline', off);
+    return () => { window.removeEventListener('online',on); window.removeEventListener('offline',off); };
+  }, []);
+
+  // ── Initial load + migration + real-time listeners
+  useEffect(() => {
+    let checksOff = null;
+    let pointsOff = null;
+
+    fRef('').once('value').then(snap => {
+      const raw  = snap.val() || {};
+      const data = migrateData(raw);
+
+      // Persist migration if version changed
+      if (data.schemaVersion !== raw.schemaVersion) {
+        fRef('').update({ schemaVersion: data.schemaVersion });
+      }
+
+      if (data.members?.length)      setMembers(data.members);
+      if (data.kidHabits?.length)    setKidHabits(data.kidHabits);
+      if (data.parentHabits?.length) setParentHabits(data.parentHabits);
+      if (data.rotation?.length)     setRotation(data.rotation);
+      if (data.setupDone)            setSetupDone(true);
+      if (data.parentPin)            setParentPin(data.parentPin);
+
+      // Last-used member stored in localStorage per uid (device-local, not synced)
+      try { const w = localStorage.getItem(`dh-who-${uid}`); if (w) setWho(w); } catch {}
+
+      // Real-time listeners for frequently-changing data
+      checksOff = fRef('checks').on('value',  s => setChecksData(s.val() || {}));
+      pointsOff = fRef('points').on('value',  s => setPointsData(s.val() || {}));
+
+      setLoaded(true);
+    }).catch(e => { setError('Failed to load: '+e.message); setLoaded(true); });
+
+    return () => {
+      if (checksOff) fRef('checks').off('value', checksOff);
+      if (pointsOff) fRef('points').off('value', pointsOff);
+    };
+  }, [uid]);
+
+  // ── Debounced meta write — 800ms after last change
+  const debouncedMeta = useMemo(() => debounce((m, kh, ph, r, pin) => {
+    fRef('').update({ members:m, kidHabits:kh, parentHabits:ph, rotation:r,
+                      parentPin:pin, schemaVersion:SCHEMA_VERSION, updatedAt:Date.now() });
+  }, 800), [uid]);
+  useEffect(() => () => debouncedMeta.cancel(), [debouncedMeta]);
+
+  const saveMeta = useCallback((m, kh, ph, r, pin=parentPin) => {
+    setMembers(m); setKidHabits(kh); setParentHabits(ph); setRotation(r);
+    if (pin !== undefined) setParentPin(pin);
+    debouncedMeta(m, kh, ph, r, pin);
+  }, [debouncedMeta, parentPin]);
+
+  const saveWho = useCallback(w => {
+    setWho(w);
+    try { if (w) localStorage.setItem(`dh-who-${uid}`, w);
+          else   localStorage.removeItem(`dh-who-${uid}`); } catch {}
+  }, [uid]);
+
+  const finishSetup = useCallback((m, kh, ph, r, pin) => {
+    setSetupDone(true);
+    saveMeta(m, kh, ph, r, pin);
+    fRef('setupDone').set(true);
+  }, [saveMeta]);
+
+  // ── Optimistic habit toggle with Firebase rollback
+  const toggleHabit = useCallback((name, tid) => {
+    const day    = dayKey();
+    const sk     = toKey(name);
+    const cur    = checksData[name]?.[day]?.[tid] || false;
+    const next   = !cur;
+
+    // Immediate local update (optimistic)
+    setChecksData(prev => ({
+      ...prev,
+      [name]: { ...(prev[name]||{}), [day]: { ...(prev[name]?.[day]||{}), [tid]:next } }
+    }));
+
+    // Points logic for children
+    const m = members.find(x => x.name===name);
+    if (m?.role==='child') {
+      const delta = next ? POINTS_PER : -POINTS_PER;
+      fRef(`points/${sk}`).transaction(cur => Math.max(0,(cur||0)+delta));
+
+      if (next) {
+        const flat    = getFlatHabits(name, members, kidHabits, parentHabits, rotation);
+        const allDone = flat.every(t => t.id===tid ? true : (checksData[name]?.[day]?.[t.id]||false));
+        if (allDone) {
+          fRef(`points/${sk}`).transaction(cur => (cur||0)+POINTS_BONUS);
+          const ck = name+day;
+          if (!celebRef.current[ck]) { celebRef.current[ck]=true; setTimeout(burst,200); }
+        }
+      }
+    }
+
+    // Firebase write — rollback UI if it fails
+    fRef(`checks/${sk}/${day}/${tid}`).set(next).catch(() => {
+      setChecksData(prev => ({
+        ...prev,
+        [name]: { ...(prev[name]||{}), [day]: { ...(prev[name]?.[day]||{}), [tid]:cur } }
+      }));
+    });
+  }, [checksData, members, kidHabits, parentHabits, rotation, uid]);
+
+  // ── Derived helpers
+  const isChecked = useCallback((name,tid) =>
+    checksData[name]?.[dayKey()]?.[tid] || false
+  , [checksData]);
+
+  const doneCount = useCallback(name =>
+    getFlatHabits(name, members, kidHabits, parentHabits, rotation)
+      .filter(t => isChecked(name,t.id)).length
+  , [members, kidHabits, parentHabits, rotation, isChecked]);
+
+  const getPoints = useCallback(name =>
+    pointsData[toKey(name)] || 0
+  , [pointsData]);
+
+  const getStreak = useCallback(name => {
+    const today = new Date();
+    const cd    = checksData[name] || {};
+    const tot   = getFlatHabits(name, members, kidHabits, parentHabits, rotation).length;
+    if (tot===0) return 0;
+    let streak = 0;
+    for (let i=1; i<365; i++) {
+      const d = new Date(today); d.setDate(d.getDate()-i);
+      const k = d.toISOString().slice(0,10);
+      const dayChecks = cd[k];
+      if (!dayChecks) break;
+      if (Object.values(dayChecks).filter(v=>v===true).length >= Math.floor(tot*.8)) streak++;
+      else break;
+    }
+    const todayDone = getFlatHabits(name, members, kidHabits, parentHabits, rotation)
+      .filter(t=>isChecked(name,t.id)).length;
+    if (todayDone===tot && tot>0) streak++;
+    return streak;
+  }, [checksData, members, kidHabits, parentHabits, rotation, isChecked]);
+
+  const getHistory = useCallback(name => {
+    const cd  = checksData[name] || {};
+    const tot = getFlatHabits(name, members, kidHabits, parentHabits, rotation).length;
+    return Object.keys(cd)
+      .filter(k => /^\d{4}-\d{2}-\d{2}$/.test(k))
+      .sort().reverse().slice(0,30)
+      .map(k => {
+        const done = Object.values(cd[k]).filter(v=>v===true).length;
+        return { date:k, done, total:tot, pct:calcPct(done,tot) };
+      });
+  }, [checksData, members, kidHabits, parentHabits, rotation]);
+
+  // ── 7 PM notification — with cleanup to prevent memory leak
+  useEffect(() => {
+    if (!who) return;
+    const flat = getFlatHabits(who, members, kidHabits, parentHabits, rotation);
+    if (flat.length===0) return;
+    const target = new Date(); target.setHours(19,0,0,0);
+    if (target <= new Date()) target.setDate(target.getDate()+1);
+    const tid = setTimeout(async () => {
+      const remaining = flat.length - doneCount(who);
+      if (remaining > 0 && Notification.permission==='granted') {
+        new Notification('Daily Habits',{
+          body:`${remaining} habit${remaining>1?'s':''} still to go, ${who}!`,
+          icon:'/icon-192.png'
+        });
+      }
+    }, target-Date.now());
+    return () => clearTimeout(tid); // ← prevents duplicate notifications
+  }, [who, members, kidHabits, parentHabits, rotation]);
+
+  const value = {
+    checksData, pointsData, members, kidHabits, parentHabits, rotation, parentPin,
+    who, setupDone, loaded, error, online,
+    setMembers, setKidHabits, setParentHabits, setRotation,
+    saveWho, finishSetup, saveMeta, toggleHabit,
+    isChecked, doneCount, getPoints, getStreak, getHistory,
+    signOut: () => { saveWho(null); auth.signOut(); },
+    userEmail: user.email,
+  };
+
+  return <DataCtx.Provider value={value}>{children}</DataCtx.Provider>;
+}
+
+// ════════════════════════════════════════════════════════
+// SHARED COMPONENTS
+// ════════════════════════════════════════════════════════
+const Avatar = memo(function Avatar({ m, size=40 }) {
+  const c = COLORS[m.colorIdx % COLORS.length];
+  return (
+    <div aria-hidden="true" style={{width:size,height:size,borderRadius:size*.35,background:c.bg,
+      display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0}}>
+      <span style={{fontFamily:SERIF,fontSize:size*.4,color:'#fff'}}>{m.initial||m.name[0]}</span>
+    </div>
+  );
+});
+
+function SuggestionBrowser({ targetHabits, onAdd, sugCat, onToggleCat }) {
+  return (
+    <div style={{...S.card,marginBottom:16}}>
+      <h3 style={{...S.serif(18),marginBottom:4}}>browse habit ideas</h3>
+      <p style={{fontSize:12,color:'#bfb5a2',marginBottom:16}}>tap a category · tap a habit to add</p>
+      <div style={{display:'flex',flexWrap:'wrap',gap:6,marginBottom:sugCat?16:0}}
+        role="tablist" aria-label="Habit suggestion categories">
+        {Object.keys(SUGGESTIONS).map(cat => (
+          <button key={cat} role="tab" aria-selected={sugCat===cat}
+            onClick={()=>onToggleCat(cat)}
+            style={{padding:'6px 14px',borderRadius:20,fontFamily:SANS,cursor:'pointer',transition:'all .15s',
+              border:`1px solid ${sugCat===cat?'#3d3830':'#e8e2d8'}`,
+              background:sugCat===cat?'#3d3830':'#fff',
+              color:sugCat===cat?'#fff':'#8a7060',fontSize:12}}>
+            {cat}
+          </button>
+        ))}
+      </div>
+      {sugCat && (
+        <div style={{display:'flex',flexWrap:'wrap',gap:8,marginTop:4}} role="tabpanel">
+          {SUGGESTIONS[sugCat].map(s => {
+            const already = targetHabits.some(h=>h.label===s);
+            return (
+              <button key={s} disabled={already} onClick={()=>!already&&onAdd(s)}
+                aria-pressed={already}
+                style={{padding:'7px 14px',borderRadius:20,fontSize:12,fontFamily:SANS,
+                  cursor:already?'default':'pointer',transition:'all .15s',
+                  background:already?'#f0ebe4':'#faf8f5',
+                  color:already?'#bfb5a2':'#3d3830',
+                  border:`1px solid ${already?'#e8e2d8':'#c8c0b4'}`,
+                  opacity:already?.6:1}}>
+                {already?`✓ ${s}`:`+ ${s}`}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════
+// SETUP WIZARD  (4 steps: Family → Habits → Chores → PIN)
+// ════════════════════════════════════════════════════════
+function Setup() {
+  const { finishSetup, signOut } = useData();
+  const [step,        setStep]        = useState(0);
+  const [memberRows,  setMemberRows]  = useState([{name:'',role:'parent'},{name:'',role:'child'}]);
+  const [pin,         setPin]         = useState('');
+  const [pinConfirm,  setPinConfirm]  = useState('');
+  const [pinErr,      setPinErr]      = useState('');
+  const [kidH,        setKidH]        = useState(DEFAULT_KID_HABITS);
+  const [parH,        setParH]        = useState(DEFAULT_PARENT_HABITS);
+  const [rot,         setRot]         = useState(DEFAULT_ROTATION);
+  const [sugCat,      setSugCat]      = useState('');
+  const [sugTarget,   setSugTarget]   = useState('kid');
+  const TOTAL = 4;
+
+  const next = () => setStep(s=>Math.min(s+1, TOTAL-1));
+  const back = () => setStep(s=>Math.max(s-1, 0));
+
+  const handleFinish = () => {
+    if (pin.length!==4)    return setPinErr('PIN must be exactly 4 digits.');
+    if (pin!==pinConfirm)  return setPinErr("PINs don't match — try again.");
+    const members = memberRows.filter(m=>m.name.trim()).map((m,i)=>({
+      id:mkId(), name:sanitize(m.name.trim()), role:m.role,
+      colorIdx:i%COLORS.length, initial:sanitize(m.name.trim())[0]?.toUpperCase()||'?'
+    }));
+    if (!members.some(m=>m.role==='parent')) return setPinErr('Please add at least one parent.');
+    if (!members.some(m=>m.role==='child'))  return setPinErr('Please add at least one child.');
+    finishSetup(members, kidH, parH, rot, pin);
+  };
+
+  const Dots = () => (
+    <div style={{display:'flex',justifyContent:'center',gap:6,marginBottom:28}}>
+      {[...Array(TOTAL)].map((_,i)=>(
+        <div key={i} style={{height:8,borderRadius:4,transition:'all .3s',
+          width:i===step?20:8,
+          background:i===step?'#3d3830':i<step?'#8a7060':'#e8e2d8'}}/>
+      ))}
+    </div>
+  );
+
+  return (
+    <div style={{...S.shell,minHeight:'100vh'}}>
+      <div style={{...S.page,paddingTop:40}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:32}}>
+          <h1 style={S.serif(30)}>set up your family</h1>
+          <button onClick={signOut} style={{background:'none',border:'none',fontSize:12,color:'#bfb5a2',cursor:'pointer',fontFamily:SANS}}>sign out</button>
+        </div>
+        <Dots/>
+
+        {/* Step 0 — Family members */}
+        {step===0 && (
+          <div className="dh-si">
+            <p style={{fontSize:11,color:'#bfb5a2',letterSpacing:1.4,textTransform:'uppercase',marginBottom:20}}>who's in your family?</p>
+            {memberRows.map((m,i)=>(
+              <div key={i} style={{display:'flex',gap:8,marginBottom:10,alignItems:'center'}}>
+                <input value={m.name} onChange={e=>{const n=[...memberRows];n[i]={...n[i],name:e.target.value};setMemberRows(n);}}
+                  placeholder={m.role==='parent'?'Parent name':`Child name`} maxLength={30}
+                  style={{...S.input,flex:1}} aria-label={`Member ${i+1} name`}/>
+                <select value={m.role} onChange={e=>{const n=[...memberRows];n[i]={...n[i],role:e.target.value};setMemberRows(n);}}
+                  style={{...S.input,width:'auto',padding:'12px 10px',cursor:'pointer'}} aria-label={`Member ${i+1} role`}>
+                  <option value="parent">Parent</option>
+                  <option value="child">Child</option>
+                </select>
+                {memberRows.length>2&&(
+                  <button onClick={()=>setMemberRows(memberRows.filter((_,j)=>j!==i))}
+                    style={{background:'none',border:'1px solid #e8e2d8',borderRadius:10,width:40,height:44,cursor:'pointer',color:'#bfb5a2',fontSize:18}}
+                    aria-label="Remove member">×</button>
+                )}
+              </div>
+            ))}
+            {memberRows.length<8&&(
+              <button onClick={()=>setMemberRows([...memberRows,{name:'',role:'child'}])}
+                style={{...S.btnSec,marginTop:4,marginBottom:24}}>+ add family member</button>
+            )}
+            <button onClick={next} style={S.btnP}>next →</button>
+          </div>
+        )}
+
+        {/* Step 1 — Habits */}
+        {step===1 && (
+          <div className="dh-si">
+            <p style={{fontSize:11,color:'#bfb5a2',letterSpacing:1.4,textTransform:'uppercase',marginBottom:20}}>set up daily habits</p>
+            <div style={{display:'flex',background:'#f0ebe4',borderRadius:12,padding:3,marginBottom:20}}>
+              {['kid','parent'].map(t=>(
+                <button key={t} onClick={()=>setSugTarget(t)}
+                  style={{flex:1,padding:10,background:sugTarget===t?'#fff':'none',border:'none',borderRadius:10,
+                    fontSize:13,fontWeight:sugTarget===t?600:400,color:sugTarget===t?'#3d3830':'#bfb5a2',cursor:'pointer',fontFamily:SANS,transition:'all .15s'}}>
+                  {t==='kid'?"Kids' habits":'Parent habits'}
+                </button>
+              ))}
+            </div>
+            <SuggestionBrowser
+              targetHabits={sugTarget==='kid'?kidH:parH}
+              onAdd={s=>{const h={id:mkId(),label:s,category:''};sugTarget==='kid'?setKidH([...kidH,h]):setParH([...parH,h]);}}
+              sugCat={sugCat} onToggleCat={c=>setSugCat(sugCat===c?'':c)}/>
+            <div style={S.card}>
+              <h4 style={{...S.serif(15),marginBottom:12}}>{sugTarget==='kid'?"Kids'":"Parent"} habits ({(sugTarget==='kid'?kidH:parH).length})</h4>
+              {(sugTarget==='kid'?kidH:parH).map((h,i)=>(
+                <div key={h.id} style={{display:'flex',alignItems:'center',gap:8,padding:'8px 0',
+                  borderBottom:i<(sugTarget==='kid'?kidH:parH).length-1?'1px solid #f0ebe4':'none'}}>
+                  <span style={{flex:1,fontSize:13,color:'#6b6358'}}>{h.label}</span>
+                  <button onClick={()=>sugTarget==='kid'?setKidH(kidH.filter(x=>x.id!==h.id)):setParH(parH.filter(x=>x.id!==h.id))}
+                    style={{background:'none',border:'none',fontSize:16,color:'#ddd6ca',cursor:'pointer'}} aria-label={`Remove ${h.label}`}>×</button>
+                </div>
+              ))}
+            </div>
+            <div style={{display:'flex',gap:10,marginTop:8}}>
+              <button onClick={back} style={{...S.btnSec,flex:1}}>← back</button>
+              <button onClick={next} style={{...S.btnP,flex:2}}>next →</button>
+            </div>
+          </div>
+        )}
+
+        {/* Step 2 — Chore rotation */}
+        {step===2 && (
+          <div className="dh-si">
+            <p style={{fontSize:11,color:'#bfb5a2',letterSpacing:1.4,textTransform:'uppercase',marginBottom:8}}>chore rotation</p>
+            <p style={{fontSize:13,color:'#8a7060',marginBottom:20,lineHeight:1.6}}>One rotating chore is added to each child's list daily, cycling through this list automatically.</p>
+            {rot.map((r,i)=>(
+              <div key={r.id} style={{display:'flex',gap:8,marginBottom:8,alignItems:'center'}}>
+                <input value={r.label} onChange={e=>{const n=[...rot];n[i]={...r,label:sanitize(e.target.value)};setRot(n);}}
+                  style={{...S.input,flex:1}} placeholder={`Chore ${i+1}`} maxLength={60} aria-label={`Chore ${i+1}`}/>
+                <button onClick={()=>setRot(rot.filter((_,j)=>j!==i))}
+                  style={{background:'none',border:'1px solid #e8e2d8',borderRadius:10,width:40,height:44,cursor:'pointer',color:'#bfb5a2',fontSize:18}}
+                  aria-label="Remove chore">×</button>
+              </div>
+            ))}
+            <input placeholder="add a chore + press enter" maxLength={60}
+              onKeyDown={e=>{if(e.key==='Enter'&&e.target.value.trim()){setRot([...rot,{id:mkId(),label:sanitize(e.target.value.trim())}]);e.target.value='';}}}
+              style={{...S.input,marginTop:4,marginBottom:24}} aria-label="Add chore"/>
+            <div style={{display:'flex',gap:10}}>
+              <button onClick={back} style={{...S.btnSec,flex:1}}>← back</button>
+              <button onClick={next} style={{...S.btnP,flex:2}}>next →</button>
+            </div>
+          </div>
+        )}
+
+        {/* Step 3 — Parent PIN */}
+        {step===3 && (
+          <div className="dh-si">
+            <p style={{fontSize:11,color:'#bfb5a2',letterSpacing:1.4,textTransform:'uppercase',marginBottom:8}}>parent dashboard pin</p>
+            <p style={{fontSize:13,color:'#8a7060',marginBottom:28,lineHeight:1.6}}>Set a 4-digit PIN so only you can access the parent dashboard and edit habits.</p>
+            <div style={{marginBottom:14}}>
+              <label style={S.label}>create 4-digit pin</label>
+              <input type="password" inputMode="numeric" value={pin}
+                onChange={e=>{setPin(e.target.value.replace(/\D/g,'').slice(0,4));setPinErr('');}}
+                placeholder="••••" maxLength={4}
+                style={{...S.input,letterSpacing:10,fontSize:22,textAlign:'center'}} aria-label="Create PIN"/>
+            </div>
+            <div style={{marginBottom:24}}>
+              <label style={S.label}>confirm pin</label>
+              <input type="password" inputMode="numeric" value={pinConfirm}
+                onChange={e=>{setPinConfirm(e.target.value.replace(/\D/g,'').slice(0,4));setPinErr('');}}
+                placeholder="••••" maxLength={4}
+                style={{...S.input,letterSpacing:10,fontSize:22,textAlign:'center'}} aria-label="Confirm PIN"/>
+            </div>
+            {pinErr&&<div role="alert" style={{fontSize:13,color:'#a84444',background:'#fdf0ee',border:'1px solid #f0c8c0',borderRadius:10,padding:'10px 14px',marginBottom:16}}>{pinErr}</div>}
+            <div style={{display:'flex',gap:10}}>
+              <button onClick={back} style={{...S.btnSec,flex:1}}>← back</button>
+              <button onClick={handleFinish} style={{...S.btnP,flex:2}}>let's go →</button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════
+// MEMBER PICKER
+// ════════════════════════════════════════════════════════
+function Picker() {
+  const { members, saveWho, signOut } = useData();
+  return (
+    <div style={{...S.shell,display:'flex',alignItems:'center',justifyContent:'center',minHeight:'100vh'}}>
+      <div style={{...S.page,paddingTop:40,paddingBottom:40,width:'100%'}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:36}}>
+          <h1 style={S.serif(32)}>who's checking in?</h1>
+          <button onClick={signOut} style={{background:'none',border:'none',fontSize:12,color:'#bfb5a2',cursor:'pointer',fontFamily:SANS,marginTop:6}}>sign out</button>
+        </div>
+        <div style={{display:'flex',flexDirection:'column',gap:10}} role="list">
+          {members.map(m=>(
+            <button key={m.id} onClick={()=>saveWho(m.name)}
+              role="listitem" aria-label={`Continue as ${m.name}`}
+              style={{display:'flex',alignItems:'center',gap:16,padding:'16px 20px',
+                background:'#fff',border:'1px solid #e8e2d8',borderRadius:20,
+                cursor:'pointer',textAlign:'left',transition:'all .15s',fontFamily:SANS}}>
+              <Avatar m={m} size={44}/>
+              <div style={{flex:1}}>
+                <div style={{fontSize:16,fontWeight:600,color:'#3d3830'}}>{m.name}</div>
+                <div style={{fontSize:12,color:'#bfb5a2',marginTop:2,textTransform:'capitalize'}}>{m.role}</div>
+              </div>
+              <span style={{fontSize:20,color:'#e8e2d8'}}>›</span>
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════
+// PARENT PIN GATE
+// ════════════════════════════════════════════════════════
+function PinGate({ onSuccess, onCancel }) {
+  const { parentPin } = useData();
+  const [attempt, setAttempt] = useState('');
+  const [err,     setErr]     = useState(false);
+  const inputRef = useRef(null);
+
+  useEffect(()=>{ inputRef.current?.focus(); },[]);
+
+  const verify = () => {
+    if (attempt===parentPin) { onSuccess(); }
+    else {
+      setErr(true); setAttempt('');
+      inputRef.current?.focus();
+      const el = document.getElementById('dh-pin-inp');
+      if (el) { el.classList.add('dh-shake'); setTimeout(()=>el.classList.remove('dh-shake'),400); }
+    }
+  };
+
+  return (
+    <div style={{...S.shell,display:'flex',alignItems:'center',justifyContent:'center',minHeight:'100vh'}}>
+      <div style={{maxWidth:300,width:'100%',padding:'0 20px',textAlign:'center'}}>
+        <h2 style={{...S.serif(26),marginBottom:8}}>parent dashboard</h2>
+        <p style={{fontSize:13,color:'#bfb5a2',marginBottom:28}}>enter your PIN to continue</p>
+        <input id="dh-pin-inp" ref={inputRef} type="password" inputMode="numeric"
+          value={attempt} onChange={e=>{setAttempt(e.target.value.replace(/\D/g,'').slice(0,4));setErr(false);}}
+          onKeyDown={e=>e.key==='Enter'&&verify()}
+          placeholder="••••" maxLength={4}
+          style={{...S.input,letterSpacing:12,fontSize:24,textAlign:'center',marginBottom:16}}
+          aria-label="Enter PIN"/>
+        {err&&<p role="alert" style={{fontSize:12,color:'#a84444',marginBottom:12}}>Incorrect PIN — try again</p>}
+        <button onClick={verify} style={{...S.btnP,marginBottom:10}}>unlock</button>
+        <button onClick={onCancel} style={S.btnSec}>cancel</button>
+      </div>
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════
+// HABITS VIEW
+// ════════════════════════════════════════════════════════
+function HabitsView() {
+  const { who, members, kidHabits, parentHabits, rotation,
+          isChecked, doneCount, toggleHabit, getStreak, getPoints,
+          saveWho, online } = useData();
+  const [pinGate,  setPinGate]  = useState(false);
+  const [showDash, setShowDash] = useState(false);
+
+  const m      = members.find(x=>x.name===who);
+  const flat   = getFlatHabits(who, members, kidHabits, parentHabits, rotation);
+  const done   = doneCount(who);
+  const total  = flat.length;
+  const pct    = calcPct(done, total);
+  const allDone= total>0 && done===total;
+  const streak = getStreak(who);
+  const pts    = getPoints(who);
+  const c      = COLORS[(m?.colorIdx||0) % COLORS.length];
+
+  const greeting = () => {
+    const h = new Date().getHours();
+    return h<12?'good morning,':h<17?'good afternoon,':'good evening,';
+  };
+
+  if (pinGate)  return <PinGate onSuccess={()=>{setPinGate(false);setShowDash(true);}} onCancel={()=>setPinGate(false)}/>;
+  if (showDash) return <Dashboard onBack={()=>setShowDash(false)}/>;
+
+  return (
+    <div style={S.shell}>
+      {/* Offline banner */}
+      {!online&&(
+        <div role="status" style={{background:'#fdf0ee',borderBottom:'1px solid #f0c8c0',
+          padding:'8px 20px',fontSize:12,color:'#a84444',textAlign:'center'}}>
+          you're offline — changes will sync when reconnected
+        </div>
+      )}
+
+      <div style={S.page}>
+        {/* Header row */}
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:32}}>
+          <button onClick={()=>saveWho(null)}
+            style={{background:'none',border:'none',display:'flex',alignItems:'center',gap:10,cursor:'pointer',padding:0}}
+            aria-label="Switch user">
+            {m&&<Avatar m={m} size={36}/>}
+            <span style={{fontSize:12,color:'#bfb5a2',letterSpacing:.5,fontFamily:SANS}}>switch</span>
+          </button>
+          <div style={{display:'flex',alignItems:'center',gap:10}}>
+            {m?.role==='child'&&(
+              <div style={{display:'flex',alignItems:'center',gap:4,background:'#faf6ee',border:'1px solid #ede5d2',borderRadius:10,padding:'5px 12px'}}>
+                <span style={{fontSize:12,color:'#c4a24e'}}>✦</span>
+                <span style={{fontSize:14,fontWeight:700,color:'#c4a24e'}}>{pts}</span>
+              </div>
+            )}
+            {m?.role==='parent'&&(
+              <button onClick={()=>setPinGate(true)}
+                style={{background:'none',border:'1px solid #e8e2d8',borderRadius:10,padding:'6px 14px',
+                  fontSize:12,color:'#8a7060',cursor:'pointer',fontFamily:SANS}}>
+                dashboard
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Greeting */}
+        <div style={{marginBottom:24}}>
+          <p style={{fontSize:11,color:'#bfb5a2',letterSpacing:1.5,textTransform:'uppercase',marginBottom:4}}>{greeting()}</p>
+          <h1 style={{...S.serif(36),lineHeight:1.1}} role="status" aria-live="polite">
+            {allDone?'you\'re all done.':total===0?'no habits yet.':`${total-done} ${total-done===1?'thing':'things'} left`}
+          </h1>
+        </div>
+
+        {/* Progress bar + streak */}
+        {total>0&&(
+          <div style={{display:'flex',alignItems:'center',gap:14,marginBottom:28}}>
+            <div style={{flex:1}}>
+              <div style={{width:'100%',height:6,background:'#ece7df',borderRadius:3,overflow:'hidden'}}
+                role="progressbar" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100}
+                aria-label={`${pct}% of habits complete`}>
+                <div style={{height:'100%',borderRadius:3,width:`${pct}%`,transition:'width .5s cubic-bezier(.16,1,.3,1)',
+                  background:allDone?'#7d9e7e':`linear-gradient(90deg,${c.color}88,${c.color})`}}/>
+              </div>
+              <div style={{display:'flex',justifyContent:'space-between',marginTop:5}}>
+                <span style={{fontSize:11,color:'#ccc2b2'}}>{done}/{total}</span>
+                <span style={{fontSize:11,fontWeight:700,color:allDone?'#7d9e7e':'#ccc2b2'}}>{pct}%</span>
+              </div>
+            </div>
+            <div style={{display:'flex',flexDirection:'column',alignItems:'center',minWidth:52,
+              background:'#fff',border:'1px solid #e8e2d8',borderRadius:14,padding:'8px 6px'}}>
+              <span style={{fontSize:18,fontWeight:800,color:streak>0?'#c4a24e':'#e0d8cc'}}>{streak}</span>
+              <span style={{fontSize:9,color:'#bfb5a2',letterSpacing:.5,textTransform:'uppercase',marginTop:2}}>streak</span>
+            </div>
+          </div>
+        )}
+
+        {/* Habit list */}
+        <div role="list" aria-label="Today's habits">
+          {flat.map(h=>{
+            const checked = isChecked(who, h.id);
+            return (
+              <div key={h.id} role="listitem">
+                <button onClick={()=>toggleHabit(who,h.id)}
+                  aria-pressed={checked}
+                  aria-label={`${h.label}, ${checked?'completed':'not completed'}`}
+                  style={{width:'100%',display:'flex',alignItems:'center',gap:14,
+                    padding:'14px 16px',borderRadius:16,marginBottom:8,cursor:'pointer',
+                    textAlign:'left',transition:'all .2s',fontFamily:SANS,
+                    background:checked?'#f7f5f0':'#fff',
+                    border:`1px solid ${checked?'#e0d8cc':'#e8e2d8'}`}}>
+                  {/* Checkbox circle */}
+                  <div style={{width:24,height:24,borderRadius:8,flexShrink:0,transition:'all .2s',
+                    background:checked?c.color:'transparent',
+                    border:`2px solid ${checked?c.color:'#d8d0c8'}`,
+                    display:'flex',alignItems:'center',justifyContent:'center'}}>
+                    {checked&&<span style={{color:'#fff',fontSize:13,lineHeight:1}}>✓</span>}
+                  </div>
+                  <div style={{flex:1}}>
+                    <span style={{fontSize:15,fontWeight:500,transition:'all .2s',
+                      color:checked?'#bfb5a2':'#3d3830',
+                      textDecoration:checked?'line-through':'none'}}>{h.label}</span>
+                    {h.category&&<span style={{display:'block',fontSize:11,color:'#ccc2b2',marginTop:2}}>{h.category}</span>}
+                  </div>
+                </button>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* All-done card */}
+        {allDone&&(
+          <div role="status" aria-live="polite" className="dh-cpop"
+            style={{textAlign:'center',padding:'28px 20px',background:'#f7fdf7',
+              border:'1px solid #a5d6a7',borderRadius:20,marginTop:8}}>
+            <div style={{fontSize:28,marginBottom:8}}>✦</div>
+            <p style={{...S.serif(22),color:'#4a7a4c',marginBottom:6}}>all done, {who}!</p>
+            <p style={{fontSize:13,color:'#7aaa7c'}}>great work today</p>
+          </div>
+        )}
+
+        {/* Evening nudge */}
+        {!allDone&&total>0&&new Date().getHours()>=19&&(
+          <div role="alert" style={{textAlign:'center',padding:'16px',background:'#fdf6ee',
+            border:'1px solid #ede5d2',borderRadius:16,marginTop:8}}>
+            <p style={{fontSize:13,color:'#8a7060'}}>almost bedtime — {total-done} left to go ✦</p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════
+// PARENT DASHBOARD
+// ════════════════════════════════════════════════════════
+function Dashboard({ onBack }) {
+  const { members, kidHabits, parentHabits, rotation, parentPin,
+          doneCount, getStreak, getHistory, getPoints, saveMeta, signOut, userEmail } = useData();
+  const [tab,         setTab]         = useState('today');
+  const [editTarget,  setEditTarget]  = useState('kid');
+  const [editSugCat,  setEditSugCat]  = useState('');
+  const [localKidH,   setLocalKidH]   = useState(kidHabits);
+  const [localParH,   setLocalParH]   = useState(parentHabits);
+  const [localRot,    setLocalRot]    = useState(rotation);
+  const [localMem,    setLocalMem]    = useState(members);
+  const TABS = ['today','history','edit'];
+
+  const handleSave = () => saveMeta(localMem, localKidH, localParH, localRot, parentPin);
+
+  return (
+    <div style={S.shell}>
+      <div style={S.page}>
+        {/* Header */}
+        <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:28}}>
+          <button onClick={onBack} style={{background:'none',border:'none',fontSize:13,color:'#bfb5a2',cursor:'pointer',fontFamily:SANS}}>← back</button>
+          <h1 style={S.serif(22)}>parent dashboard</h1>
+          <button onClick={signOut} style={{background:'none',border:'none',fontSize:12,color:'#bfb5a2',cursor:'pointer',fontFamily:SANS}}>sign out</button>
+        </div>
+
+        {userEmail&&<p style={{fontSize:11,color:'#ccc2b2',textAlign:'center',marginBottom:20,letterSpacing:.5}}>{userEmail}</p>}
+
+        {/* Tabs */}
+        <div style={{display:'flex',background:'#f0ebe4',borderRadius:12,padding:3,marginBottom:24}} role="tablist">
+          {TABS.map(t=>(
+            <button key={t} role="tab" aria-selected={tab===t} onClick={()=>setTab(t)}
+              style={{flex:1,padding:10,background:tab===t?'#fff':'none',border:'none',borderRadius:10,
+                fontSize:13,fontWeight:tab===t?600:400,color:tab===t?'#3d3830':'#bfb5a2',
+                cursor:'pointer',fontFamily:SANS,transition:'all .15s',textTransform:'capitalize'}}>
+              {t}
+            </button>
+          ))}
+        </div>
+
+        {/* TODAY */}
+        {tab==='today'&&(
+          <div>
+            {members.map(m=>{
+              const flat=getFlatHabits(m.name,members,kidHabits,parentHabits,rotation);
+              const done=doneCount(m.name),total=flat.length,pct=calcPct(done,total);
+              const streak=getStreak(m.name), pts=getPoints(m.name);
+              return (
+                <div key={m.id} style={{...S.card,marginBottom:12}}>
+                  <div style={{display:'flex',alignItems:'center',gap:12,marginBottom:12}}>
+                    <Avatar m={m} size={38}/>
+                    <div style={{flex:1}}>
+                      <div style={{fontSize:15,fontWeight:600}}>{m.name}</div>
+                      <div style={{fontSize:11,color:'#bfb5a2',marginTop:1}}>
+                        {done}/{total} today · {streak} day streak
+                        {m.role==='child'&&<span style={{color:'#c4a24e',marginLeft:8}}>✦ {pts} pts</span>}
+                      </div>
+                    </div>
+                    <span style={{fontSize:20,fontWeight:800,color:pct===100?'#7d9e7e':'#c4a24e'}}>{pct}%</span>
+                  </div>
+                  <div style={{width:'100%',height:5,background:'#ece7df',borderRadius:3}}
+                    role="progressbar" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100} aria-label={`${m.name} ${pct}% complete`}>
+                    <div style={{height:'100%',borderRadius:3,width:`${pct}%`,transition:'width .5s ease',
+                      background:pct===100?'#7d9e7e':COLORS[m.colorIdx%COLORS.length].color}}/>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* HISTORY */}
+        {tab==='history'&&(
+          <div>
+            {members.map(m=>{
+              const hist=getHistory(m.name);
+              return (
+                <div key={m.id} style={{...S.card,marginBottom:12}}>
+                  <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:14}}>
+                    <Avatar m={m} size={32}/>
+                    <span style={{fontSize:15,fontWeight:600}}>{m.name}</span>
+                  </div>
+                  {hist.length===0
+                    ? <p style={{fontSize:13,color:'#bfb5a2'}}>No history yet.</p>
+                    : <div style={{display:'flex',gap:4,flexWrap:'wrap'}}>
+                        {hist.map(h=>(
+                          <div key={h.date} title={`${h.date}: ${h.done}/${h.total} (${h.pct}%)`}
+                            style={{width:28,height:28,borderRadius:7,fontSize:9,fontWeight:700,
+                              display:'flex',alignItems:'center',justifyContent:'center',
+                              background:h.pct===100?'#7d9e7e':h.pct>=60?'#c4a24e':'#e8e2d8',
+                              color:h.pct>=60?'#fff':'#bfb5a2'}}>
+                            {h.pct}
+                          </div>
+                        ))}
+                      </div>
+                  }
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* EDIT */}
+        {tab==='edit'&&(
+          <div>
+            <div style={{display:'flex',background:'#f0ebe4',borderRadius:12,padding:3,marginBottom:20}}>
+              {['kid','parent','rotation'].map(t=>(
+                <button key={t} onClick={()=>setEditTarget(t)}
+                  style={{flex:1,padding:8,background:editTarget===t?'#fff':'none',border:'none',borderRadius:10,
+                    fontSize:12,fontWeight:editTarget===t?600:400,color:editTarget===t?'#3d3830':'#bfb5a2',
+                    cursor:'pointer',fontFamily:SANS,transition:'all .15s'}}>
+                  {t==='kid'?'Kids':t==='parent'?'Parent':'Rotation'}
+                </button>
+              ))}
+            </div>
+
+            {editTarget!=='rotation'&&(
+              <SuggestionBrowser
+                targetHabits={editTarget==='kid'?localKidH:localParH}
+                onAdd={s=>{const h={id:mkId(),label:s,category:''};
+                  editTarget==='kid'?setLocalKidH([...localKidH,h]):setLocalParH([...localParH,h]);}}
+                sugCat={editSugCat} onToggleCat={c=>setEditSugCat(editSugCat===c?'':c)}/>
+            )}
+
+            <div style={S.card}>
+              {editTarget==='rotation'?(
+                <>
+                  <h4 style={{...S.serif(15),marginBottom:12}}>chore rotation ({localRot.length})</h4>
+                  {localRot.map((r,i)=>(
+                    <div key={r.id} style={{display:'flex',alignItems:'center',gap:8,marginBottom:8}}>
+                      <input value={r.label} onChange={e=>{const n=[...localRot];n[i]={...r,label:sanitize(e.target.value)};setLocalRot(n);}}
+                        style={{...S.input,flex:1,fontSize:13,padding:'10px 12px'}} maxLength={60}/>
+                      <button onClick={()=>setLocalRot(localRot.filter((_,j)=>j!==i))}
+                        style={{background:'none',border:'none',fontSize:18,color:'#ddd6ca',cursor:'pointer'}} aria-label="Remove chore">×</button>
+                    </div>
+                  ))}
+                  <input placeholder="add chore + enter" maxLength={60}
+                    onKeyDown={e=>{if(e.key==='Enter'&&e.target.value.trim()){setLocalRot([...localRot,{id:mkId(),label:sanitize(e.target.value.trim())}]);e.target.value='';}}}
+                    style={{...S.input,fontSize:13,padding:'10px 12px',marginTop:8}}/>
+                </>
+              ):(
+                <>
+                  <h4 style={{...S.serif(15),marginBottom:12}}>{editTarget==='kid'?"Kids'":"Parent"} habits ({(editTarget==='kid'?localKidH:localParH).length})</h4>
+                  {(editTarget==='kid'?localKidH:localParH).map((h,i)=>(
+                    <div key={h.id} style={{display:'flex',alignItems:'center',gap:8,padding:'8px 0',
+                      borderBottom:'1px solid #f0ebe4'}}>
+                      <span style={{flex:1,fontSize:13,color:'#6b6358'}}>{h.label}</span>
+                      <button onClick={()=>editTarget==='kid'?setLocalKidH(localKidH.filter(x=>x.id!==h.id)):setLocalParH(localParH.filter(x=>x.id!==h.id))}
+                        style={{background:'none',border:'none',fontSize:18,color:'#ddd6ca',cursor:'pointer'}} aria-label={`Remove ${h.label}`}>×</button>
+                    </div>
+                  ))}
+                </>
+              )}
+            </div>
+
+            <button onClick={handleSave} style={{...S.btnP,marginTop:4}}>save changes</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════
+// ERROR BOUNDARY
+// ════════════════════════════════════════════════════════
+class ErrorBoundary extends React.Component {
+  constructor(p) { super(p); this.state={error:null}; }
+  static getDerivedStateFromError(e) { return {error:e}; }
+  render() {
+    if (this.state.error) return (
+      <div style={{...S.shell,display:'flex',alignItems:'center',justifyContent:'center',minHeight:'100vh'}}>
+        <div style={{textAlign:'center',padding:'0 24px',maxWidth:360}}>
+          <h1 style={{...S.serif(24),marginBottom:12}}>something went wrong</h1>
+          <p style={{fontSize:13,color:'#bfb5a2',lineHeight:1.6,marginBottom:20}}>{this.state.error?.message}</p>
+          <button onClick={()=>this.setState({error:null})} style={S.btnP}>try again</button>
+        </div>
+      </div>
+    );
+    return this.props.children;
+  }
+}
+
+// ════════════════════════════════════════════════════════
+// ROOT
+// ════════════════════════════════════════════════════════
+function Loading({ label='loading…' }) {
+  return (
+    <div style={{...S.shell,display:'flex',alignItems:'center',justifyContent:'center',minHeight:'100vh'}}>
+      <div style={{textAlign:'center'}}>
+        <h1 style={{...S.serif(34),opacity:.7}}>daily habits</h1>
+        <p style={{fontSize:13,color:'#bfb5a2',marginTop:10}}>{label}</p>
+      </div>
+    </div>
+  );
+}
+
+function AppContent() {
+  const { loaded, error, setupDone, who } = useData();
+  if (!loaded)    return <Loading label="syncing your family…"/>;
+  if (error)      return <div style={{...S.shell,padding:40}}><p style={{color:'#a84444'}}>{error}</p></div>;
+  if (!setupDone) return <Setup/>;
+  if (!who)       return <Picker/>;
+  return <HabitsView/>;
+}
+
+function AppRouter({ user }) {
+  return (
+    <DataProvider user={user}>
+      <AppContent/>
+    </DataProvider>
+  );
+}
+
+function Root() {
+  const { user } = useAuth();
+  if (user===undefined) return <Loading label="signing you in…"/>;
+  if (user===null)      return <AuthScreen/>;
+  return <AppRouter user={user}/>;
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <ErrorBoundary>
+    <AuthProvider>
+      <Root/>
+    </AuthProvider>
+  </ErrorBoundary>
+);
+</script>
+</body>
+</html>

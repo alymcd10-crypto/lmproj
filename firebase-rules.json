@@ -1,0 +1,10 @@
+{
+  "rules": {
+    "f": {
+      "$familyId": {
+        ".read": true,
+        ".write": true
+      }
+    }
+  }
+}
