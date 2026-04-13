@@ -129,11 +129,13 @@
 
     /* ── Status Badge ── */
     .status-badge { display:inline-flex; align-items:center; gap:5px; font-size:.75rem; font-weight:600; padding:3px 10px; border-radius:999px; white-space:nowrap; }
-    .status-badge.verified   { background:#d1fae5; color:#065f46; }
-    .status-badge.outdated   { background:#fee2e2; color:#991b1b; }
-    .status-badge.uncertain  { background:#fef3c7; color:#92400e; }
-    .status-badge.pending    { background:#f3f4f6; color:#6b7280; }
-    .status-badge.reviewed   { background:#ede9fe; color:#5b21b6; }
+    .status-badge.verified       { background:#d1fae5; color:#065f46; }
+    .status-badge.outdated       { background:#fee2e2; color:#991b1b; }
+    .status-badge.uncertain      { background:#f3f4f6; color:#6b7280; }
+    .status-badge.check-required { background:#fff7ed; color:#9a3412; }
+    .status-badge.company-change { background:#f3e8ff; color:#6b21a8; }
+    .status-badge.pending        { background:#f3f4f6; color:#6b7280; }
+    .status-badge.reviewed       { background:#ede9fe; color:#5b21b6; }
 
     /* ── Photo Cell ── */
     .photo-cell { width:44px; height:44px; border-radius:50%; overflow:hidden; border:2px solid var(--rule); background:var(--warm); display:flex; align-items:center; justify-content:center; font-weight:700; font-size:.9rem; color:var(--muted); flex-shrink:0; }
@@ -247,13 +249,15 @@ const MIN_VERIFIED_FIELDS = 2;  // minimum number of verified fields required fo
 const GENERIC_EMAIL_PREFIXES = /^(noreply|no-reply|donotreply|support|info|admin|webmaster)@/;
 
 const STAGE_LABELS = {
-  format:    "Validating format…",
-  google:    "Searching Google…",
-  ddg:       "Searching DuckDuckGo…",
-  linkedin:  "Checking LinkedIn…",
-  website:   "Checking company website…",
-  photo:     "Retrieving photo…",
-  comparing: "Comparing results…",
+  format:    "✅ Validating format…",
+  google:    "🔍 Searching Google…",
+  ddg:       "🔍 Searching DuckDuckGo…",
+  linkedin:  "💼 Checking LinkedIn…",
+  website:   "🌐 Parsing company website…",
+  directory: "📋 Checking professional directory…",
+  gravatar:  "📸 Checking Gravatar…",
+  photo:     "📸 Retrieving photo…",
+  comparing: "🔄 Comparing results…",
 };
 
 /* ══════════════════════════════════════════════════════════════
@@ -325,6 +329,7 @@ async function proxyFetch(targetUrl) {
   const proxies = [
     u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
     u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
+    u => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
   ];
   for (const mk of proxies) {
     try {
@@ -333,6 +338,46 @@ async function proxyFetch(targetUrl) {
     } catch {}
   }
   return null;
+}
+
+/* ── SHA-256 hex digest (native, no library needed) ── */
+async function sha256hex(str) {
+  const data = new TextEncoder().encode(str);
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  return [...new Uint8Array(hash)].map(b => b.toString(16).padStart(2,'0')).join('');
+}
+
+/* ── Gravatar photo lookup (free, email-based, no API key) ── */
+async function fetchGravatar(email) {
+  if (!email) return null;
+  try {
+    const hash = await sha256hex(email.toLowerCase().trim());
+    // d=404 makes Gravatar return HTTP 404 when no avatar exists (so we know it's real)
+    const testUrl = `https://www.gravatar.com/avatar/${hash}?d=404&s=200&r=pg`;
+    const resp = await fetch(testUrl, { signal: AbortSignal.timeout(5000) });
+    if (resp.ok) return `https://www.gravatar.com/avatar/${hash}?s=200&r=pg`;
+  } catch {}
+  return null;
+}
+
+/* ── Professional directory search (DuckDuckGo site: query, free) ── */
+async function searchDirectoryFree(name, type) {
+  const found = { phone: null, email: null };
+  try {
+    const site = type === 'lawyer' ? 'avvo.com' : 'realtor.com';
+    const term = type === 'lawyer' ? 'attorney' : 'realtor';
+    const q = `"${name}" ${term} site:${site}`;
+    const ddg = await ddgSearch(q);
+    if (ddg) {
+      const allText = [ddg.Abstract, ddg.AbstractText,
+        ...(ddg.RelatedTopics || []).map(t => t.Text || '')].join(' ');
+      const ps = extractPhones(allText);
+      const es = extractEmails(allText).filter(e => !GENERIC_EMAIL_PREFIXES.test(e));
+      if (ps.length) found.phone = ps[0];
+      if (es.length) found.email = es[0];
+    }
+  } catch {}
+  return found;
 }
 
 async function fetchLinkedInProfile(url, rapidApiKey) {
@@ -382,6 +427,7 @@ async function verifyContact(contact, apiConfig = {}, onStage = null) {
     webSources: [],
     searchMethod: "format-only",
     confidence: 0,
+    lastVerified: new Date().toISOString(),
   };
 
   /* ── Stage 1: Format validation (always runs) ── */
@@ -475,13 +521,17 @@ async function verifyContact(contact, apiConfig = {}, onStage = null) {
         results.webSources.push("DuckDuckGo");
         results.searchMethod = "duckduckgo";
       } else {
+        // Search was attempted but returned no useful data — still record this
+        results.searchMethod = "searched-no-results";
         webData = null;
       }
+    } else {
+      results.searchMethod = "searched-no-results";
     }
   }
 
   /* ── Stage 4: Company website scraping (CORS proxy) ── */
-  if (webData?.websiteUrl && !webData.phone && !webData.email) {
+  if (webData?.websiteUrl) {
     onStage?.("website");
     const html = await proxyFetch(webData.websiteUrl);
     if (html) {
@@ -490,7 +540,44 @@ async function verifyContact(contact, apiConfig = {}, onStage = null) {
       const es = extractEmails(text).filter(e=>!GENERIC_EMAIL_PREFIXES.test(e));
       if (ps.length && !webData.phone) webData.phone = ps[0];
       if (es.length && !webData.email) webData.email = es[0];
-      if (ps.length || es.length) results.webSources.push("Company Website");
+      if ((ps.length || es.length) && !results.webSources.includes("Company Website")) {
+        results.webSources.push("Company Website");
+      }
+    }
+    // Also try /contact, /about, /team pages if no data yet
+    if (!webData.phone && !webData.email) {
+      for (const path of ["/contact", "/about", "/team", "/staff"]) {
+        try {
+          const base = webData.websiteUrl.replace(/\/+$/, "");
+          const html2 = await proxyFetch(base + path);
+          if (!html2) continue;
+          const t2 = html2.replace(/<[^>]+>/g," ").replace(/\s+/g," ");
+          const ps2 = extractPhones(t2);
+          const es2 = extractEmails(t2).filter(e=>!GENERIC_EMAIL_PREFIXES.test(e));
+          if (ps2.length && !webData.phone) webData.phone = ps2[0];
+          if (es2.length && !webData.email) webData.email = es2[0];
+          if ((ps2.length || es2.length) && !results.webSources.includes("Company Website")) {
+            results.webSources.push("Company Website");
+          }
+          if (webData.phone || webData.email) break;
+        } catch {}
+      }
+    }
+  }
+
+  /* ── Stage 4b: Professional directory search (free, no key) ── */
+  if (!webData?.phone && !webData?.email && contact.name) {
+    onStage?.("directory");
+    const dirResult = await searchDirectoryFree(contact.name, contact.type);
+    if (dirResult.phone || dirResult.email) {
+      if (!webData) webData = {};
+      if (dirResult.phone && !webData.phone) webData.phone = dirResult.phone;
+      if (dirResult.email && !webData.email) webData.email = dirResult.email;
+      const dirSource = contact.type === 'lawyer' ? "Avvo (via DDG)" : "Realtor.com (via DDG)";
+      results.webSources.push(dirSource);
+      if (results.searchMethod === "format-only" || results.searchMethod === "searched-no-results") {
+        results.searchMethod = "duckduckgo";
+      }
     }
   }
 
@@ -534,6 +621,12 @@ async function verifyContact(contact, apiConfig = {}, onStage = null) {
   if (!results.photoUrl && webData?.photoThumbnail) {
     results.photoUrl = webData.photoThumbnail;
     results.photoSrc = "Web Search";
+  }
+  // Gravatar (free, email-based — works without any API key)
+  if (!results.photoUrl && contact.email) {
+    onStage?.("gravatar");
+    const grav = await fetchGravatar(contact.email);
+    if (grav) { results.photoUrl = grav; results.photoSrc = "Gravatar"; }
   }
   if (!results.photoUrl) {
     const seed = contact.name.split("").reduce((a,c)=>a+c.charCodeAt(0),0);
@@ -607,13 +700,16 @@ async function verifyContact(contact, apiConfig = {}, onStage = null) {
 
   /* ── Overall status ── */
   const statuses = [results.email.status, results.phone.status, results.address.status];
+  const hasWebData = !!(results.webFound?.phone || results.webFound?.email || results.webFound?.linkedinUrl);
   if (results.webFound?.companyChanged) {
     results.overall = "company-change";
   } else if (statuses.includes("outdated")) {
     results.overall = "outdated";
   } else if (statuses.filter(s=>s==="verified").length >= MIN_VERIFIED_FIELDS) {
     results.overall = "verified";
-  } else if (!results.webFound?.phone && !results.webFound?.email && results.searchMethod !== "format-only") {
+  } else if (hasWebData && statuses.some(s=>s==="uncertain")) {
+    results.overall = "check-required"; // web data found but doesn't perfectly match original
+  } else if (!hasWebData && results.searchMethod !== "format-only") {
     results.overall = "uncertain"; // searched but found nothing useful
   } else if (statuses.includes("uncertain")) {
     results.overall = "uncertain";
@@ -631,12 +727,30 @@ function exportCSV(contacts) {
   const cols = ["name","type","phone","email","address","company","license",
                 "emailStatus","emailNote","phoneStatus","phoneNote","addressStatus","addressNote",
                 "overallStatus","confidence","searchMethod","webSources",
-                "webFoundPhone","webFoundEmail","webFoundHeadline","webFoundCompany","linkedinUrl",
-                "photoSrc","photoUrl","reviewed","actioned","notes"];
+                "foundEmail","emailMatch","foundPhone","phoneMatch",
+                "foundCompany","companyMatch","foundAddress","addressMatch",
+                "photoUrl","photoSource","webSource","confidenceScore","lastVerified",
+                "linkedinUrl","webFoundHeadline",
+                "reviewed","actioned","notes"];
   const rows = [cols.join(",")];
   contacts.forEach(c => {
     const v = c.verification || {};
     const wf = v.webFound || {};
+    // Compute match fields
+    const recEmailNorm = (c.email||"").toLowerCase().trim();
+    const webEmailNorm = (wf.email||"").toLowerCase().trim();
+    const recEmailDomain = recEmailNorm.includes("@") ? recEmailNorm.split("@")[1] : null;
+    const webEmailDomain = webEmailNorm.includes("@") ? webEmailNorm.split("@")[1] : null;
+    const emailMatch = wf.email
+      ? (recEmailNorm === webEmailNorm ? "yes"
+        : (recEmailDomain && webEmailDomain && recEmailDomain === webEmailDomain) ? "different-alias" : "different")
+      : "";
+    const recPhoneNorm = normalizePhone(c.phone||"").replace(/^\+1/,"");
+    const webPhoneNorm = normalizePhone(wf.phone||"").replace(/^\+1/,"");
+    const phoneMatch = wf.phone
+      ? (recPhoneNorm && webPhoneNorm && recPhoneNorm === webPhoneNorm ? "yes" : "different")
+      : "";
+    const companyMatch = wf.companyChanged ? "changed" : (wf.company ? (wf.company === c.company ? "yes" : "check") : "");
     const row = [
       c.name, c.type, c.phone, c.email, c.address, c.company, c.license,
       v.email?.status||"", v.email?.note||"",
@@ -646,9 +760,17 @@ function exportCSV(contacts) {
       v.confidence!=null ? v.confidence : "",
       v.searchMethod||"",
       (v.webSources||[]).join("; "),
-      wf.phone||"", wf.email||"", wf.headline||"", wf.company||"", wf.linkedinUrl||"",
-      v.photoSrc||"",
+      // New required columns
+      wf.email||"", emailMatch,
+      wf.phone||"", phoneMatch,
+      wf.company||"", companyMatch,
+      wf.address||"", "",
       v.photoUrl||"",
+      v.photoSrc||"",
+      (v.webSources||[])[0]||"",
+      v.confidence!=null ? v.confidence : "",
+      v.lastVerified||"",
+      wf.linkedinUrl||"", wf.headline||"",
       c.reviewed?"yes":"no",
       c.actioned?"yes":"no",
       (c.notes||"").replace(/,/g,";").replace(/\n/g," ")
@@ -826,12 +948,13 @@ function SettingsPanel({ apiConfig, onSave, onClose }) {
 /* ── Status Badge ── */
 function StatusBadge({ status }) {
   const map = {
-    verified:        { icon:"✓", label:"Verified",        cls:"verified" },
-    outdated:        { icon:"✗", label:"Needs Update",    cls:"outdated" },
-    uncertain:       { icon:"?", label:"Uncertain",        cls:"uncertain" },
-    pending:         { icon:"⋯", label:"Pending",          cls:"pending" },
-    reviewed:        { icon:"★", label:"Reviewed",         cls:"reviewed" },
-    "company-change":{ icon:"⚠", label:"Company Change",  cls:"outdated" },
+    verified:         { icon:"✓",  label:"Verified",          cls:"verified" },
+    outdated:         { icon:"✗",  label:"Outdated",           cls:"outdated" },
+    uncertain:        { icon:"?",  label:"Unable to Verify",   cls:"uncertain" },
+    "check-required": { icon:"⚠", label:"Check Required",     cls:"check-required" },
+    pending:          { icon:"⋯", label:"Pending",             cls:"pending" },
+    reviewed:         { icon:"★",  label:"Reviewed",           cls:"reviewed" },
+    "company-change": { icon:"📍", label:"Company Change",     cls:"company-change" },
   };
   const s = map[status] || map.pending;
   return <span className={`status-badge ${s.cls}`}>{s.icon} {s.label}</span>;
@@ -988,10 +1111,21 @@ function DetailPanel({ contact, onClose, onUpdate }) {
               background: v.confidence >= 70 ? "var(--green)" : v.confidence >= 40 ? "var(--amber)" : "var(--red)",
             }} />
           </div>
-          <div style={{fontSize:".75rem",color:"var(--muted)",marginTop:3,display:"flex",justifyContent:"space-between"}}>
+          <div style={{fontSize:".75rem",color:"var(--muted)",marginTop:3,display:"flex",justifyContent:"space-between",flexWrap:"wrap",gap:4}}>
             <span>{v.confidence}% confidence</span>
-            <span style={{fontStyle:"italic"}}>{v.searchMethod === "format-only" ? "Format validation only — add SerpAPI key for web search" : `Verified via ${v.searchMethod}`}</span>
+            <span style={{fontStyle:"italic"}}>
+              {v.searchMethod === "format-only"
+                ? "Format validation only — add SerpAPI key for enhanced results"
+                : v.searchMethod === "searched-no-results"
+                  ? "Web searched — no public records found"
+                  : `Verified via ${v.searchMethod}`}
+            </span>
           </div>
+          {v.lastVerified && (
+            <div style={{fontSize:".7rem",color:"var(--muted)",marginTop:3}}>
+              Last searched: {new Date(v.lastVerified).toLocaleString()}
+            </div>
+          )}
         </>}
 
         <hr className="divider" />
@@ -1262,13 +1396,15 @@ function App() {
 
   /* ── Stats ── */
   const stats = useMemo(() => {
-    const verified  = contacts.filter(c => c.verification?.overall==="verified").length;
-    const outdated  = contacts.filter(c => c.verification?.overall==="outdated").length;
-    const uncertain = contacts.filter(c => c.verification?.overall==="uncertain").length;
-    const pending   = contacts.filter(c => !c.verification).length;
-    const reviewed  = contacts.filter(c => c.reviewed).length;
+    const verified      = contacts.filter(c => c.verification?.overall==="verified").length;
+    const outdated      = contacts.filter(c => c.verification?.overall==="outdated").length;
+    const uncertain     = contacts.filter(c => c.verification?.overall==="uncertain").length;
+    const checkRequired = contacts.filter(c => c.verification?.overall==="check-required").length;
+    const companyChange = contacts.filter(c => c.verification?.overall==="company-change").length;
+    const pending       = contacts.filter(c => !c.verification).length;
+    const reviewed      = contacts.filter(c => c.reviewed).length;
     const pct = contacts.length ? Math.round((verified/contacts.length)*100) : 0;
-    return { total:contacts.length, verified, outdated, uncertain, pending, reviewed, pct };
+    return { total:contacts.length, verified, outdated, uncertain, checkRequired, companyChange, pending, reviewed, pct };
   }, [contacts]);
 
   /* ── Wizard complete ── */
@@ -1347,12 +1483,18 @@ function App() {
             </div>
             <div className="stat-box red">
               <div className="stat-num">{stats.outdated}</div>
-              <div className="stat-lbl">✗ Needs Update</div>
+              <div className="stat-lbl">✗ Outdated</div>
             </div>
             <div className="stat-box amber">
-              <div className="stat-num">{stats.uncertain}</div>
-              <div className="stat-lbl">? Uncertain</div>
+              <div className="stat-num">{stats.checkRequired + stats.uncertain}</div>
+              <div className="stat-lbl">⚠ Needs Review</div>
             </div>
+            {stats.companyChange > 0 && (
+              <div className="stat-box" style={{borderColor:"#c084fc"}}>
+                <div className="stat-num" style={{color:"#6b21a8"}}>{stats.companyChange}</div>
+                <div className="stat-lbl">📍 Company Change</div>
+              </div>
+            )}
             <div className="stat-box">
               <div className="stat-num">{stats.pending}</div>
               <div className="stat-lbl">⋯ Pending</div>
@@ -1437,7 +1579,7 @@ function App() {
                   }}>↺ Re-verify All</button>
                 )}
                 <span style={{fontSize:".8rem",color:"var(--muted)"}}>
-                  {stats.verified} verified · {stats.outdated} need updates · {stats.uncertain} uncertain · {stats.pending} pending
+                  {stats.verified} verified · {stats.outdated} outdated · {stats.checkRequired} need check · {stats.uncertain} unable to verify · {stats.pending} pending
                 </span>
               </div>
             )}
@@ -1451,12 +1593,30 @@ function App() {
               </div>
             )}
 
+            {/* Results summary after verification */}
+            {!processing && contacts.some(c=>c.verification) && (
+              <div style={{marginTop:14,padding:"12px 14px",background:"var(--warm)",borderRadius:8,fontSize:".82rem"}}>
+                <strong>Search summary:</strong>{" "}
+                {stats.verified > 0 && <span style={{color:"var(--green)"}}>✓ {stats.verified} verified</span>}
+                {stats.verified > 0 && (stats.outdated + stats.checkRequired + stats.companyChange + stats.uncertain) > 0 && " · "}
+                {stats.outdated > 0 && <span style={{color:"var(--red)"}}>✗ {stats.outdated} outdated</span>}
+                {stats.outdated > 0 && (stats.checkRequired + stats.companyChange + stats.uncertain) > 0 && " · "}
+                {stats.checkRequired > 0 && <span style={{color:"#9a3412"}}>⚠ {stats.checkRequired} need checking</span>}
+                {stats.checkRequired > 0 && (stats.companyChange + stats.uncertain) > 0 && " · "}
+                {stats.companyChange > 0 && <span style={{color:"#6b21a8"}}>📍 {stats.companyChange} company changes</span>}
+                {stats.companyChange > 0 && stats.uncertain > 0 && " · "}
+                {stats.uncertain > 0 && <span style={{color:"var(--muted)"}}>? {stats.uncertain} unable to verify</span>}
+              </div>
+            )}
+
             <div className="wiz-note" style={{marginTop:14}}>
               ℹ️ <strong>How web scraping works:</strong> Each contact is searched via{" "}
-              {apiConfig.serpApiKey ? <strong>Google (SerpAPI)</strong> : <span>DuckDuckGo (free fallback)</span>},
-              then the company website is scraped for phone/email, and LinkedIn is searched for the current headline and photo.
+              {apiConfig.serpApiKey ? <strong>Google (SerpAPI)</strong> : <span>DuckDuckGo (free)</span>},
+              then the company website is scraped for phone/email, professional directories (Avvo / Realtor.com)
+              are checked, LinkedIn is searched for the current headline and photo, and Gravatar is checked for
+              a professional photo using the contact's email address.
               Rate limit: {RATE_LIMIT_MS/1000}s between contacts.
-              {!apiConfig.serpApiKey && <> · <button style={{background:"none",border:"none",color:"var(--navy)",textDecoration:"underline",cursor:"pointer",padding:0,font:"inherit",fontSize:".78rem"}} onClick={()=>setShowSettings(true)}>Add SerpAPI key</button> for full Google Search results.</>}
+              {!apiConfig.serpApiKey && <> · <button style={{background:"none",border:"none",color:"var(--navy)",textDecoration:"underline",cursor:"pointer",padding:0,font:"inherit",fontSize:".78rem"}} onClick={()=>setShowSettings(true)}>Add SerpAPI key</button> for enhanced Google Search results.</>}
             </div>
           </div>
         )}
@@ -1478,8 +1638,10 @@ function App() {
               <select value={filterStatus} onChange={e=>setFilterStatus(e.target.value)}>
                 <option value="all">All Statuses</option>
                 <option value="verified">✓ Verified</option>
-                <option value="outdated">✗ Needs Update</option>
-                <option value="uncertain">? Uncertain</option>
+                <option value="outdated">✗ Outdated</option>
+                <option value="check-required">⚠ Check Required</option>
+                <option value="uncertain">? Unable to Verify</option>
+                <option value="company-change">📍 Company Change</option>
                 <option value="pending">⋯ Pending</option>
               </select>
               {(filterText||filterType!=="all"||filterStatus!=="all") && (
