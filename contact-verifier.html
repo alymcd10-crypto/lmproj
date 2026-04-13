@@ -236,12 +236,15 @@ const RE_ADDR  = /\d+\s+\w/;
 
 const FREE_EMAIL_DOMAINS = ["gmail.com","yahoo.com","hotmail.com","outlook.com","aol.com","icloud.com"];
 
-const RATE_LIMIT_MS = 2500; // ms between contacts in batch (SerpAPI free: 100 req/month)
+const RATE_LIMIT_MS = 2500; // ms between contacts in batch (~3 SerpAPI calls per contact: search + LinkedIn + images)
 const MIN_PHONE_DIGITS = 7;     // minimum digit count for a valid phone number
 const MIN_COMPANY_NAME_LEN = 3; // minimum length to attempt company comparison
 const COMPANY_PREFIX_MATCH = 6; // characters to compare when checking company name similarity
 const AVG_VERIFY_SECS = 5;      // estimated avg network time per contact (used for ETA)
-const AVATAR_EVERY_N = 3;       // show DiceBear avatar for 1-in-N contacts without a photo
+const AVG_TIME_PER_CONTACT_SECS = RATE_LIMIT_MS / 1000 + AVG_VERIFY_SECS; // total secs per contact
+const AVATAR_EVERY_N = 3;       // show DiceBear avatar when seed % N === 0 (~1-in-N contacts)
+const MIN_VERIFIED_FIELDS = 2;  // minimum number of verified fields required for overall "verified" status
+const GENERIC_EMAIL_PREFIXES = /^(noreply|no-reply|donotreply|support|info|admin|webmaster)@/;
 
 const STAGE_LABELS = {
   format:    "Validating format…",
@@ -484,7 +487,7 @@ async function verifyContact(contact, apiConfig = {}, onStage = null) {
     if (html) {
       const text = html.replace(/<[^>]+>/g," ").replace(/\s+/g," ");
       const ps = extractPhones(text);
-      const es = extractEmails(text).filter(e=>!e.match(/^(noreply|no-reply|donotreply|support|info|admin|webmaster)@/));
+      const es = extractEmails(text).filter(e=>!GENERIC_EMAIL_PREFIXES.test(e));
       if (ps.length && !webData.phone) webData.phone = ps[0];
       if (es.length && !webData.email) webData.email = es[0];
       if (ps.length || es.length) results.webSources.push("Company Website");
@@ -534,7 +537,7 @@ async function verifyContact(contact, apiConfig = {}, onStage = null) {
   }
   if (!results.photoUrl) {
     const seed = contact.name.split("").reduce((a,c)=>a+c.charCodeAt(0),0);
-    if (seed % AVATAR_EVERY_N === 0) {
+    if (seed % AVATAR_EVERY_N === 0) {  // ~33% of contacts without photos get a styled avatar
       results.photoUrl = `https://api.dicebear.com/7.x/personas/svg?seed=${encodeURIComponent(contact.name)}&backgroundColor=b6e3f4,c0aede,ffd5dc`;
       results.photoSrc = "Generated Avatar";
     }
@@ -583,8 +586,9 @@ async function verifyContact(contact, apiConfig = {}, onStage = null) {
     if (webData.company && contact.company) {
       const nm = s => String(s||"").toLowerCase().replace(/[^a-z0-9]/g,"");
       const recC = nm(contact.company), webC = nm(webData.company);
+      const prefixLen = Math.min(recC.length, webC.length, COMPANY_PREFIX_MATCH);
       if (recC.length > MIN_COMPANY_NAME_LEN && webC.length > MIN_COMPANY_NAME_LEN &&
-          !recC.includes(webC.slice(0,COMPANY_PREFIX_MATCH)) && !webC.includes(recC.slice(0,COMPANY_PREFIX_MATCH))) {
+          !recC.includes(webC.slice(0,prefixLen)) && !webC.includes(recC.slice(0,prefixLen))) {
         results.webFound.companyChanged = true;
       }
     }
@@ -607,7 +611,7 @@ async function verifyContact(contact, apiConfig = {}, onStage = null) {
     results.overall = "company-change";
   } else if (statuses.includes("outdated")) {
     results.overall = "outdated";
-  } else if (statuses.filter(s=>s==="verified").length >= 2) {
+  } else if (statuses.filter(s=>s==="verified").length >= MIN_VERIFIED_FIELDS) {
     results.overall = "verified";
   } else if (!results.webFound?.phone && !results.webFound?.email && results.searchMethod !== "format-only") {
     results.overall = "uncertain"; // searched but found nothing useful
@@ -757,11 +761,9 @@ function SettingsPanel({ apiConfig, onSave, onClose }) {
   const [cfg, setCfg] = useState({ serpApiKey:"", rapidApiKey:"", ...apiConfig });
 
   function save() {
-    onSave(cfg);
-    try { localStorage.setItem("cv_api_config", JSON.stringify(cfg)); } catch {
-      // Notify via onSave so App can show a toast; keys are still active for this session
-      onSave({ ...cfg, _storageWarning: true });
-    }
+    let storageOk = true;
+    try { localStorage.setItem("cv_api_config", JSON.stringify(cfg)); } catch { storageOk = false; }
+    onSave({ ...cfg, _storageWarning: !storageOk });
     onClose();
   }
 
@@ -1418,7 +1420,7 @@ function App() {
                   <div className="prog-bar" style={{width:`${progress.total?Math.round(progress.done/progress.total*100):0}%`}} />
                 </div>
                 <div style={{fontSize:".75rem",color:"var(--muted)",marginTop:4}}>
-                  {progress.total ? Math.round(progress.done/progress.total*100) : 0}% complete · ~{Math.ceil((progress.total - progress.done) * (RATE_LIMIT_MS/1000 + AVG_VERIFY_SECS))}s remaining
+                  {progress.total ? Math.round(progress.done/progress.total*100) : 0}% complete · ~{Math.ceil((progress.total - progress.done) * AVG_TIME_PER_CONTACT_SECS)}s remaining
                 </div>
               </div>
             ) : (
