@@ -188,6 +188,21 @@
     .inline-edit:focus { border-bottom-color:var(--navy); outline:none; }
     .badge-reviewed { background:#ede9fe; color:#5b21b6; font-size:.7rem; padding:2px 8px; border-radius:4px; font-weight:600; }
     .badge-actioned { background:#d1fae5; color:#065f46; font-size:.7rem; padding:2px 8px; border-radius:4px; font-weight:600; }
+
+    /* ── Web Scraping UI ── */
+    .stage-lbl { font-size:.75rem; color:var(--muted); margin-top:3px; }
+    .web-found-box { background:var(--warm); border-radius:8px; padding:12px 14px; margin-top:10px; font-size:.82rem; }
+    .web-found-box .wf-row { display:flex; gap:6px; align-items:baseline; margin-bottom:4px; }
+    .web-found-box .wf-lbl { font-size:.7rem; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:.06em; min-width:70px; }
+    .company-change-alert { background:#fef3c7; color:#92400e; border:1px solid #fcd34d; border-radius:6px; padding:10px 14px; font-size:.82rem; margin-bottom:10px; }
+    .conf-bar-wrap { background:var(--warm); border-radius:999px; height:6px; overflow:hidden; }
+    .conf-bar { height:100%; border-radius:999px; transition:width .4s; }
+    .src-tag  { display:inline-flex; align-items:center; gap:4px; font-size:.7rem; padding:2px 8px; border-radius:4px; background:#e0e7ff; color:#3730a3; font-weight:600; margin-right:4px; margin-top:4px; }
+    .wiz-field { margin-bottom:14px; }
+    .wiz-field label { display:block; font-size:.75rem; font-weight:600; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); margin-bottom:6px; }
+    .wiz-field input { width:100%; padding:11px 14px; border:1px solid var(--rule); border-radius:6px; font-size:.9rem; background:var(--cream); color:var(--ink); transition:border-color .18s; }
+    .wiz-field input:focus { border-color:var(--navy); }
+    .wiz-field .field-hint { font-size:.72rem; color:var(--muted); margin-top:4px; line-height:1.5; }
   </style>
 </head>
 <body>
@@ -221,6 +236,18 @@ const RE_ADDR  = /\d+\s+\w/;
 
 const FREE_EMAIL_DOMAINS = ["gmail.com","yahoo.com","hotmail.com","outlook.com","aol.com","icloud.com"];
 
+const RATE_LIMIT_MS = 2500; // ms between contacts in batch
+
+const STAGE_LABELS = {
+  format:    "Validating format…",
+  google:    "Searching Google…",
+  ddg:       "Searching DuckDuckGo…",
+  linkedin:  "Checking LinkedIn…",
+  website:   "Checking company website…",
+  photo:     "Retrieving photo…",
+  comparing: "Comparing results…",
+};
+
 /* ══════════════════════════════════════════════════════════════
    HELPERS
 ══════════════════════════════════════════════════════════════ */
@@ -248,18 +275,106 @@ function fmtPhone(p) {
 }
 
 /* ══════════════════════════════════════════════════════════════
-   VERIFICATION ENGINE
-   Client-side heuristic checks (no backend needed for basic validation).
-   For production, wire in an email verification API, phone lookup service,
-   or address normalisation API of your choice.
+   WEB SCRAPING & VERIFICATION ENGINE
+   Stages: format → google/ddg → website → linkedin → photo → compare
+   Falls back gracefully at every step.
 ══════════════════════════════════════════════════════════════ */
-async function verifyContact(contact) {
-  // Simulate a short async delay (0.4–1.5s) to mimic API calls
-  await new Promise(r => setTimeout(r, 400 + Math.random()*1100));
 
-  const results = { email:{}, phone:{}, address:{}, overall:"verified" };
+/* ── Text extraction helpers ── */
+function extractPhones(text) {
+  const re = /\b(\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/g;
+  return [...new Set((text.match(re)||[]).map(p=>p.trim()).filter(p=>p.replace(/\D/g,"").length>=7))];
+}
+function extractEmails(text) {
+  const re = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
+  return [...new Set((text.match(re)||[]).map(e=>e.toLowerCase()))].filter(e=>!e.match(/\.(png|jpg|gif|svg|css|js)$/));
+}
 
-  /* ── Email ── */
+/* ── Network helpers ── */
+async function ddgSearch(query) {
+  try {
+    const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_redirect=1&no_html=1&skip_disambig=1`;
+    const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (!resp.ok) return null;
+    return await resp.json();
+  } catch { return null; }
+}
+
+async function serpSearch(query, apiKey, extra = {}) {
+  try {
+    const params = new URLSearchParams({ q: query, api_key: apiKey, num: "5", ...extra });
+    const resp = await fetch(`https://serpapi.com/search.json?${params}`, { signal: AbortSignal.timeout(12000) });
+    if (!resp.ok) return null;
+    return await resp.json();
+  } catch { return null; }
+}
+
+async function proxyFetch(targetUrl) {
+  const proxies = [
+    u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+    u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
+  ];
+  for (const mk of proxies) {
+    try {
+      const resp = await fetch(mk(targetUrl), { signal: AbortSignal.timeout(7000) });
+      if (resp.ok) return await resp.text();
+    } catch {}
+  }
+  return null;
+}
+
+async function fetchLinkedInProfile(url, rapidApiKey) {
+  try {
+    const resp = await fetch(
+      `https://fresh-linkedin-profile-data.p.rapidapi.com/get-linkedin-profile?linkedin_url=${encodeURIComponent(url)}&include_skills=false`,
+      {
+        headers: {
+          "X-RapidAPI-Key": rapidApiKey,
+          "X-RapidAPI-Host": "fresh-linkedin-profile-data.p.rapidapi.com",
+        },
+        signal: AbortSignal.timeout(10000),
+      }
+    );
+    if (!resp.ok) return null;
+    const d = await resp.json();
+    return d.data || d;
+  } catch { return null; }
+}
+
+/* ── Parse organic search results for contact data ── */
+function parseOrganicResults(results, limit = 5) {
+  const found = { phone:null, email:null, websiteUrl:null, linkedinUrl:null, headline:null, company:null, photoThumbnail:null };
+  for (const r of (results||[]).slice(0, limit)) {
+    const snippet = r.snippet || "";
+    const link    = r.link    || "";
+    if (link.includes("linkedin.com/in/") && !found.linkedinUrl) {
+      found.linkedinUrl = link;
+      if (snippet.includes(" · ")) found.headline = snippet.split(" · ")[0].trim();
+    }
+    if (!found.phone) { const ps = extractPhones(snippet); if (ps.length) found.phone = ps[0]; }
+    if (!found.email) { const es = extractEmails(snippet); if (es.length) found.email = es[0]; }
+    if (!found.websiteUrl && !link.match(/linkedin|facebook|twitter|instagram|yelp\.com|google\.com/)) {
+      found.websiteUrl = link;
+    }
+  }
+  return found;
+}
+
+/* ── Main verification function ── */
+async function verifyContact(contact, apiConfig = {}, onStage = null) {
+  const results = {
+    email: {}, phone: {}, address: {},
+    overall: "uncertain",
+    photoUrl: null, photoSrc: "Generated Avatar",
+    webFound: {},
+    webSources: [],
+    searchMethod: "format-only",
+    confidence: 0,
+  };
+
+  /* ── Stage 1: Format validation (always runs) ── */
+  onStage?.("format");
+
   const email = String(contact.email||"").trim().toLowerCase();
   if (!email) {
     results.email = { status:"uncertain", note:"No email provided" };
@@ -270,11 +385,10 @@ async function verifyContact(contact) {
     const isFree = FREE_EMAIL_DOMAINS.includes(domain);
     results.email = {
       status: isFree ? "uncertain" : "verified",
-      note: isFree ? "Free email domain — may not be professional" : "Format valid · professional domain"
+      note: isFree ? "Free email domain — may not be professional" : "Format valid · professional domain",
     };
   }
 
-  /* ── Phone ── */
   const phone = String(contact.phone||"").trim();
   if (!phone) {
     results.phone = { status:"uncertain", note:"No phone provided" };
@@ -283,20 +397,17 @@ async function verifyContact(contact) {
   } else {
     const digits = normalizePhone(phone).replace(/^\+1/,"");
     if (digits.length === 10) {
-      // Simple area code check (US only)
       const areaCode = parseInt(digits.slice(0,3),10);
-      const invalidAreas = [0,1];
-      if (invalidAreas.includes(Math.floor(areaCode/100))) {
+      if ([0,1].includes(Math.floor(areaCode/100))) {
         results.phone = { status:"outdated", note:"Suspicious area code" };
       } else {
-        results.phone = { status:"verified", note:"Valid US format · " + fmtPhone(phone) };
+        results.phone = { status:"verified", note:"Valid US format · "+fmtPhone(phone) };
       }
     } else {
       results.phone = { status:"uncertain", note:"Non-standard length — could be international" };
     }
   }
 
-  /* ── Address ── */
   const addr = String(contact.address||"").trim();
   if (!addr) {
     results.address = { status:"uncertain", note:"No address provided" };
@@ -308,21 +419,192 @@ async function verifyContact(contact) {
     results.address = { status:"verified", note:"Format looks valid" };
   }
 
-  /* ── Overall ── */
-  const statuses = [results.email.status, results.phone.status, results.address.status];
-  if (statuses.includes("outdated")) results.overall = "outdated";
-  else if (statuses.includes("uncertain")) results.overall = "uncertain";
-  else results.overall = "verified";
+  /* ── Stage 2: Google Search via SerpAPI ── */
+  const searchQuery = [contact.name, contact.company, contact.type].filter(Boolean).join(" ");
+  let webData = null;
 
-  /* ── Photo (avatar placeholder – in production, call LinkedIn or Google People API) ── */
-  results.photoUrl  = null;   // null = use initials avatar
-  results.photoSrc  = "Generated Avatar";
-  // Deterministically "find" a photo for ~30% of contacts (demo behaviour)
-  const seed = contact.name.split("").reduce((a,c)=>a+c.charCodeAt(0),0);
-  if (seed % 3 === 0) {
-    // Use DiceBear API for realistic placeholder photos (free, no-auth)
-    results.photoUrl = `https://api.dicebear.com/7.x/personas/svg?seed=${encodeURIComponent(contact.name)}&backgroundColor=b6e3f4,c0aede,ffd5dc`;
-    results.photoSrc = "Avatar (LinkedIn/Google photo lookup requires API key)";
+  if (apiConfig.serpApiKey) {
+    onStage?.("google");
+    const data = await serpSearch(searchQuery, apiConfig.serpApiKey);
+    if (data) {
+      webData = parseOrganicResults(data.organic_results);
+      // Knowledge Graph overrides (highest confidence)
+      const kg = data.knowledge_graph || {};
+      if (kg.phone) webData.phone = kg.phone;
+      if (kg.website) webData.websiteUrl = kg.website;
+      // Local results (Google Maps/Business)
+      const lp = data.local_results?.places?.[0];
+      if (lp?.phone && !webData.phone) webData.phone = lp.phone;
+      if (lp?.website && !webData.websiteUrl) webData.websiteUrl = lp.website;
+      results.webSources.push("Google (SerpAPI)");
+      results.searchMethod = "serpapi";
+    }
+  }
+
+  /* ── Stage 3: DuckDuckGo fallback (free, no key needed) ── */
+  if (!webData) {
+    onStage?.("ddg");
+    const ddg = await ddgSearch(searchQuery);
+    if (ddg) {
+      const allText = [ddg.Abstract, ddg.AbstractText, ...(ddg.RelatedTopics||[]).map(t=>t.Text||"")].join(" ");
+      const ps = extractPhones(allText);
+      const es = extractEmails(allText);
+      const liTopic = (ddg.RelatedTopics||[]).find(t=>t.FirstURL?.includes("linkedin.com/in/"));
+      webData = {
+        phone: ps[0]||null,
+        email: es[0]||null,
+        websiteUrl: ddg.AbstractURL||null,
+        linkedinUrl: liTopic?.FirstURL||null,
+        headline: null,
+        company: null,
+        photoThumbnail: ddg.Image||null,
+      };
+      if (webData.phone||webData.email||webData.websiteUrl||webData.linkedinUrl) {
+        results.webSources.push("DuckDuckGo");
+        results.searchMethod = "duckduckgo";
+      } else {
+        webData = null;
+      }
+    }
+  }
+
+  /* ── Stage 4: Company website scraping (CORS proxy) ── */
+  if (webData?.websiteUrl && !webData.phone && !webData.email) {
+    onStage?.("website");
+    const html = await proxyFetch(webData.websiteUrl);
+    if (html) {
+      const text = html.replace(/<[^>]+>/g," ").replace(/\s+/g," ");
+      const ps = extractPhones(text);
+      const es = extractEmails(text).filter(e=>!e.match(/example|noreply|support@|info@/));
+      if (ps.length && !webData.phone) webData.phone = ps[0];
+      if (es.length && !webData.email) webData.email = es[0];
+      if (ps.length || es.length) results.webSources.push("Company Website");
+    }
+  }
+
+  /* ── Stage 5: LinkedIn URL lookup (SerpAPI site: search) ── */
+  let linkedinUrl = webData?.linkedinUrl || null;
+  if (!linkedinUrl && apiConfig.serpApiKey) {
+    onStage?.("linkedin");
+    const liData = await serpSearch(`site:linkedin.com/in "${contact.name}" ${contact.type}`, apiConfig.serpApiKey);
+    const liResult = (liData?.organic_results||[]).find(r=>r.link?.includes("linkedin.com/in/"));
+    if (liResult) linkedinUrl = liResult.link;
+  }
+
+  /* ── Stage 5b: LinkedIn profile data via RapidAPI ── */
+  if (linkedinUrl) {
+    if (webData) webData.linkedinUrl = linkedinUrl;
+    else webData = { linkedinUrl };
+    if (!results.webSources.includes("LinkedIn")) results.webSources.push("LinkedIn");
+    if (apiConfig.rapidApiKey) {
+      onStage?.("linkedin");
+      const liProfile = await fetchLinkedInProfile(linkedinUrl, apiConfig.rapidApiKey);
+      if (liProfile) {
+        if (liProfile.profile_pic_url) {
+          results.photoUrl = liProfile.profile_pic_url;
+          results.photoSrc = "LinkedIn";
+        }
+        if (liProfile.headline && webData) webData.headline = liProfile.headline;
+        if (liProfile.company_name && webData) webData.company = liProfile.company_name;
+        if (liProfile.phone && webData && !webData.phone) webData.phone = liProfile.phone;
+        if (liProfile.email && webData && !webData.email) webData.email = liProfile.email;
+      }
+    }
+  }
+
+  /* ── Stage 6: Photo retrieval ── */
+  onStage?.("photo");
+  if (!results.photoUrl && apiConfig.serpApiKey) {
+    const imgData = await serpSearch(`${contact.name} ${contact.type||""} ${contact.company||""}`, apiConfig.serpApiKey, { tbm:"isch" });
+    const img = imgData?.images_results?.[0];
+    if (img?.thumbnail) { results.photoUrl = img.thumbnail; results.photoSrc = "Google Images"; }
+  }
+  if (!results.photoUrl && webData?.photoThumbnail) {
+    results.photoUrl = webData.photoThumbnail;
+    results.photoSrc = "Web Search";
+  }
+  if (!results.photoUrl) {
+    const seed = contact.name.split("").reduce((a,c)=>a+c.charCodeAt(0),0);
+    if (seed % 3 === 0) {
+      results.photoUrl = `https://api.dicebear.com/7.x/personas/svg?seed=${encodeURIComponent(contact.name)}&backgroundColor=b6e3f4,c0aede,ffd5dc`;
+      results.photoSrc = "Generated Avatar";
+    }
+  }
+
+  /* ── Stage 7: Compare web data with record ── */
+  onStage?.("comparing");
+  if (webData && (webData.phone || webData.email || webData.linkedinUrl || webData.headline)) {
+    results.webFound = { ...webData };
+
+    // Phone comparison
+    if (webData.phone) {
+      const recP = normalizePhone(contact.phone||"").replace(/^\+1/,"");
+      const webP = normalizePhone(webData.phone).replace(/^\+1/,"");
+      if (recP && webP) {
+        if (recP === webP) {
+          results.phone = { status:"verified", note:`Confirmed: ${webData.phone}`, found:webData.phone, source:results.webSources[0]||"Web" };
+        } else {
+          results.phone = { status:"outdated", note:`Web shows: ${webData.phone}`, found:webData.phone, source:results.webSources[0]||"Web" };
+        }
+      } else if (!recP && webP) {
+        results.phone = { status:"uncertain", note:`Found: ${webData.phone}`, found:webData.phone, source:results.webSources[0]||"Web" };
+      }
+    }
+
+    // Email comparison
+    if (webData.email) {
+      const recE = (contact.email||"").toLowerCase().trim();
+      const webE = webData.email.toLowerCase().trim();
+      if (recE && webE) {
+        if (recE === webE) {
+          results.email = { status:"verified", note:`Confirmed: ${webData.email}`, found:webData.email, source:results.webSources[0]||"Web" };
+        } else {
+          const sameDomain = recE.split("@")[1] === webE.split("@")[1];
+          results.email = {
+            status: sameDomain ? "uncertain" : "outdated",
+            note: (sameDomain ? "Same domain, different alias" : "Different email found") + `: ${webData.email}`,
+            found: webData.email,
+            source: results.webSources[0]||"Web",
+          };
+        }
+      }
+    }
+
+    // Company change detection
+    if (webData.company && contact.company) {
+      const nm = s => String(s||"").toLowerCase().replace(/[^a-z0-9]/g,"");
+      const recC = nm(contact.company), webC = nm(webData.company);
+      if (recC.length > 3 && webC.length > 3 && !recC.includes(webC.slice(0,6)) && !webC.includes(recC.slice(0,6))) {
+        results.webFound.companyChanged = true;
+      }
+    }
+  }
+
+  /* ── Confidence score ── */
+  let conf = 0;
+  if (results.email?.status  === "verified")  conf += 35;
+  else if (results.email?.status  === "uncertain") conf += 15;
+  if (results.phone?.status  === "verified")  conf += 35;
+  else if (results.phone?.status  === "uncertain") conf += 15;
+  if (results.address?.status === "verified") conf += 20;
+  else if (results.address?.status === "uncertain") conf += 10;
+  if (results.photoUrl && results.photoSrc !== "Generated Avatar") conf += 10;
+  results.confidence = Math.min(100, conf);
+
+  /* ── Overall status ── */
+  const statuses = [results.email.status, results.phone.status, results.address.status];
+  if (results.webFound?.companyChanged) {
+    results.overall = "company-change";
+  } else if (statuses.includes("outdated")) {
+    results.overall = "outdated";
+  } else if (statuses.filter(s=>s==="verified").length >= 2) {
+    results.overall = "verified";
+  } else if (!results.webFound?.phone && !results.webFound?.email && results.searchMethod !== "format-only") {
+    results.overall = "uncertain"; // searched but found nothing useful
+  } else if (statuses.includes("uncertain")) {
+    results.overall = "uncertain";
+  } else {
+    results.overall = "verified";
   }
 
   return results;
@@ -334,17 +616,25 @@ async function verifyContact(contact) {
 function exportCSV(contacts) {
   const cols = ["name","type","phone","email","address","company","license",
                 "emailStatus","emailNote","phoneStatus","phoneNote","addressStatus","addressNote",
-                "overallStatus","photoSrc","reviewed","actioned","notes"];
+                "overallStatus","confidence","searchMethod","webSources",
+                "webFoundPhone","webFoundEmail","webFoundHeadline","webFoundCompany","linkedinUrl",
+                "photoSrc","photoUrl","reviewed","actioned","notes"];
   const rows = [cols.join(",")];
   contacts.forEach(c => {
     const v = c.verification || {};
+    const wf = v.webFound || {};
     const row = [
       c.name, c.type, c.phone, c.email, c.address, c.company, c.license,
       v.email?.status||"", v.email?.note||"",
       v.phone?.status||"", v.phone?.note||"",
       v.address?.status||"", v.address?.note||"",
       v.overall||"pending",
+      v.confidence!=null ? v.confidence : "",
+      v.searchMethod||"",
+      (v.webSources||[]).join("; "),
+      wf.phone||"", wf.email||"", wf.headline||"", wf.company||"", wf.linkedinUrl||"",
       v.photoSrc||"",
+      v.photoUrl||"",
       c.reviewed?"yes":"no",
       c.actioned?"yes":"no",
       (c.notes||"").replace(/,/g,";").replace(/\n/g," ")
@@ -452,14 +742,81 @@ function Toast({ msg, type="info", onDone }) {
   return <div className={`toast ${type}`}>{msg}</div>;
 }
 
+/* ── Settings Panel ── */
+function SettingsPanel({ apiConfig, onSave, onClose }) {
+  const [cfg, setCfg] = useState({ serpApiKey:"", rapidApiKey:"", ...apiConfig });
+
+  function save() {
+    onSave(cfg);
+    try { localStorage.setItem("cv_api_config", JSON.stringify(cfg)); } catch {}
+    onClose();
+  }
+
+  return (
+    <div className="detail-overlay" onClick={e=>{ if(e.target===e.currentTarget)onClose(); }}>
+      <div className="detail-panel si">
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+          <div className="detail-name">⚙ API Configuration</div>
+          <button className="btn btn-ghost" onClick={onClose} style={{padding:"6px 12px"}}>✕</button>
+        </div>
+
+        <div className="wiz-note" style={{marginBottom:16}}>
+          API keys are stored in your browser only and sent directly to the respective service. Both are optional — the verifier works without them using DuckDuckGo (free) + format validation.
+        </div>
+
+        <div className="wiz-field">
+          <label>SerpAPI Key <span style={{fontWeight:400,textTransform:"none",letterSpacing:0}}>(Google Search)</span></label>
+          <input
+            value={cfg.serpApiKey}
+            onChange={e=>setCfg(p=>({...p,serpApiKey:e.target.value.trim()}))}
+            placeholder="your-serpapi-key"
+            type="password"
+            autoComplete="off"
+          />
+          <div className="field-hint">
+            Enables real Google Search, knowledge graph, local business results &amp; image search.
+            Free tier: ~100 searches/month at <a href="https://serpapi.com" target="_blank" rel="noreferrer">serpapi.com</a>.
+          </div>
+        </div>
+
+        <div className="wiz-field" style={{marginTop:12}}>
+          <label>RapidAPI Key <span style={{fontWeight:400,textTransform:"none",letterSpacing:0}}>(LinkedIn Profiles)</span></label>
+          <input
+            value={cfg.rapidApiKey}
+            onChange={e=>setCfg(p=>({...p,rapidApiKey:e.target.value.trim()}))}
+            placeholder="your-rapidapi-key"
+            type="password"
+            autoComplete="off"
+          />
+          <div className="field-hint">
+            Enables LinkedIn profile photo, headline &amp; current company retrieval.
+            Requires "Fresh LinkedIn Profile Data" subscription on <a href="https://rapidapi.com" target="_blank" rel="noreferrer">rapidapi.com</a>.
+          </div>
+        </div>
+
+        <div style={{display:"flex",gap:10,marginTop:20}}>
+          <button className="btn btn-primary" style={{flex:1}} onClick={save}>Save API Keys</button>
+          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+        </div>
+
+        <div style={{marginTop:14,fontSize:".75rem",color:"var(--muted)",lineHeight:1.6}}>
+          <strong>Without API keys:</strong> Verification uses DuckDuckGo Instant Answer API (free, no key needed)
+          + optional CORS-proxy scraping of company websites. Add a SerpAPI key for significantly better results.
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ── Status Badge ── */
 function StatusBadge({ status }) {
   const map = {
-    verified:  { icon:"✓", label:"Verified",      cls:"verified" },
-    outdated:  { icon:"✗", label:"Needs Update",  cls:"outdated" },
-    uncertain: { icon:"?", label:"Uncertain",      cls:"uncertain" },
-    pending:   { icon:"⋯", label:"Pending",        cls:"pending" },
-    reviewed:  { icon:"★", label:"Reviewed",       cls:"reviewed" },
+    verified:        { icon:"✓", label:"Verified",        cls:"verified" },
+    outdated:        { icon:"✗", label:"Needs Update",    cls:"outdated" },
+    uncertain:       { icon:"?", label:"Uncertain",        cls:"uncertain" },
+    pending:         { icon:"⋯", label:"Pending",          cls:"pending" },
+    reviewed:        { icon:"★", label:"Reviewed",         cls:"reviewed" },
+    "company-change":{ icon:"⚠", label:"Company Change",  cls:"outdated" },
   };
   const s = map[status] || map.pending;
   return <span className={`status-badge ${s.cls}`}>{s.icon} {s.label}</span>;
@@ -495,9 +852,9 @@ function DetailPanel({ contact, onClose, onUpdate }) {
 
   const v = contact.verification || {};
   const fieldDef = [
-    { key:"email",   label:"Email",   orig:contact.email,   found:v.email?.note,   status:v.email?.status },
-    { key:"phone",   label:"Phone",   orig:contact.phone,   found:v.phone?.note,   status:v.phone?.status },
-    { key:"address", label:"Address", orig:contact.address, found:v.address?.note, status:v.address?.status },
+    { key:"email",   label:"Email",   orig:contact.email,   found:v.email?.found||v.email?.note,   note:v.email?.note,   status:v.email?.status,   source:v.email?.source },
+    { key:"phone",   label:"Phone",   orig:contact.phone,   found:v.phone?.found||v.phone?.note,   note:v.phone?.note,   status:v.phone?.status,   source:v.phone?.source },
+    { key:"address", label:"Address", orig:contact.address, found:v.address?.found||v.address?.note, note:v.address?.note, status:v.address?.status, source:v.address?.source },
   ];
 
   return (
@@ -520,7 +877,10 @@ function DetailPanel({ contact, onClose, onUpdate }) {
 
         {v.photoSrc && (
           <div style={{fontSize:".75rem",color:"var(--muted)",marginBottom:14}}>
-            📸 Photo source: {v.photoSrc}
+            📸 Photo source: <strong>{v.photoSrc}</strong>
+            {v.webSources?.length > 0 && (
+              <span style={{marginLeft:8}}>{v.webSources.map(s=><span key={s} className="src-tag">{s}</span>)}</span>
+            )}
           </div>
         )}
 
@@ -548,14 +908,76 @@ function DetailPanel({ contact, onClose, onUpdate }) {
             {fieldDef.map(f => (
               <div className="compare-field" key={f.key}>
                 <div className="cf-label">{f.label}</div>
-                <div className={`cf-val ${f.status||""}`}>
+                <div className={`cf-val ${f.status==="verified"?"match":f.status==="outdated"?"mismatch":f.status==="uncertain"?"unknown":""}`}>
                   {f.status==="verified" ? "✓ " : f.status==="outdated" ? "✗ " : "? "}
-                  {f.found || "—"}
+                  {f.found || f.note || "—"}
                 </div>
+                {f.source && <div style={{fontSize:".68rem",color:"var(--muted)",marginTop:1}}>via {f.source}</div>}
               </div>
             ))}
           </div>
         </div>
+
+        {/* Web Found Details */}
+        {v.webFound && (v.webFound.headline || v.webFound.companyChanged || v.webFound.linkedinUrl) && <>
+          <hr className="divider" />
+          <div className="lbl-sm" style={{marginBottom:8}}>🌐 Web Search Findings</div>
+
+          {v.webFound.companyChanged && v.webFound.company && (
+            <div className="company-change-alert">
+              ⚠ Company change detected — now listed at: <strong>{v.webFound.company}</strong>
+            </div>
+          )}
+
+          <div className="web-found-box">
+            {v.webFound.headline && (
+              <div className="wf-row">
+                <span className="wf-lbl">Headline</span>
+                <span>{v.webFound.headline}</span>
+              </div>
+            )}
+            {v.webFound.company && !v.webFound.companyChanged && (
+              <div className="wf-row">
+                <span className="wf-lbl">Company</span>
+                <span>{v.webFound.company}</span>
+              </div>
+            )}
+            {v.webFound.linkedinUrl && (
+              <div className="wf-row">
+                <span className="wf-lbl">LinkedIn</span>
+                <a href={v.webFound.linkedinUrl} target="_blank" rel="noreferrer"
+                   style={{color:"var(--blue)",fontSize:".82rem",wordBreak:"break-all"}}>
+                  🔗 View Profile
+                </a>
+              </div>
+            )}
+            {v.webFound.websiteUrl && (
+              <div className="wf-row">
+                <span className="wf-lbl">Website</span>
+                <a href={v.webFound.websiteUrl} target="_blank" rel="noreferrer"
+                   style={{color:"var(--blue)",fontSize:".82rem",wordBreak:"break-all"}}>
+                  🌐 {v.webFound.websiteUrl.replace(/^https?:\/\/(www\.)?/,"").split("/")[0]}
+                </a>
+              </div>
+            )}
+          </div>
+        </>}
+
+        {/* Confidence Score */}
+        {v.confidence != null && <>
+          <hr className="divider" />
+          <div className="lbl-sm" style={{marginBottom:6}}>Confidence Score</div>
+          <div className="conf-bar-wrap">
+            <div className="conf-bar" style={{
+              width:`${v.confidence}%`,
+              background: v.confidence >= 70 ? "var(--green)" : v.confidence >= 40 ? "var(--amber)" : "var(--red)",
+            }} />
+          </div>
+          <div style={{fontSize:".75rem",color:"var(--muted)",marginTop:3,display:"flex",justifyContent:"space-between"}}>
+            <span>{v.confidence}% confidence</span>
+            <span style={{fontStyle:"italic"}}>{v.searchMethod === "format-only" ? "Format validation only — add SerpAPI key for web search" : `Verified via ${v.searchMethod}`}</span>
+          </div>
+        </>}
 
         <hr className="divider" />
 
@@ -684,7 +1106,7 @@ function App() {
 
   const [contacts,    setContacts]    = useState([]);
   const [processing,  setProcessing]  = useState(false);
-  const [progress,    setProgress]    = useState({ done:0, total:0 });
+  const [progress,    setProgress]    = useState({ done:0, total:0, stage:"", name:"" });
   const [selected,    setSelected]    = useState(null); // detail panel
   const [toast,       setToast]       = useState(null);
   const [sortCol,     setSortCol]     = useState("name");
@@ -693,6 +1115,10 @@ function App() {
   const [filterType,  setFilterType]  = useState("all");
   const [filterStatus,setFilterStatus]= useState("all");
   const [dragOver,    setDragOver]    = useState(false);
+  const [showSettings,setShowSettings]= useState(false);
+  const [apiConfig,   setApiConfig]   = useState(() => {
+    try { return JSON.parse(localStorage.getItem("cv_api_config")||"{}"); } catch { return {}; }
+  });
   const fileRef = useRef();
   const stopRef = useRef(false);
 
@@ -738,20 +1164,26 @@ function App() {
     if (!unverified.length) { showToast("All contacts already verified.", "info"); return; }
     setProcessing(true);
     stopRef.current = false;
-    setProgress({ done:0, total:unverified.length });
+    setProgress({ done:0, total:unverified.length, stage:"", name:"" });
 
     let updated = [...contacts];
     for (let i=0; i<unverified.length; i++) {
       if (stopRef.current) break;
       const c = unverified[i];
       try {
-        const v = await verifyContact(c);
+        const v = await verifyContact(c, apiConfig, (stage) => {
+          setProgress({ done:i, total:unverified.length, stage:STAGE_LABELS[stage]||stage, name:c.name });
+        });
         updated = updated.map(u => u.id === c.id ? { ...u, verification:v } : u);
         setContacts([...updated]);
-        setProgress({ done:i+1, total:unverified.length });
+        setProgress({ done:i+1, total:unverified.length, stage:"", name:"" });
+        // Rate limiting between contacts
+        if (i < unverified.length - 1 && !stopRef.current) {
+          await new Promise(r => setTimeout(r, RATE_LIMIT_MS));
+        }
       } catch(e) {
         updated = updated.map(u => u.id === c.id
-          ? { ...u, verification:{ email:{status:"uncertain",note:"Error"}, phone:{status:"uncertain",note:"Error"}, address:{status:"uncertain",note:"Error"}, overall:"uncertain", photoUrl:null, photoSrc:"" } }
+          ? { ...u, verification:{ email:{status:"uncertain",note:"Error"}, phone:{status:"uncertain",note:"Error"}, address:{status:"uncertain",note:"Error"}, overall:"uncertain", photoUrl:null, photoSrc:"", searchMethod:"error", confidence:0, webFound:{}, webSources:[] } }
           : u);
         setContacts([...updated]);
       }
@@ -870,6 +1302,12 @@ function App() {
         </div>
         <div className="topbar-right">
           {sessionId && <span style={{fontSize:".72rem",opacity:.5}}>🔥 Firebase</span>}
+          {apiConfig.serpApiKey && <span style={{fontSize:".72rem",opacity:.6,color:"#86efac"}}>🔍 SerpAPI</span>}
+          {apiConfig.rapidApiKey && <span style={{fontSize:".72rem",opacity:.6,color:"#86efac"}}>🔗 LinkedIn</span>}
+          <button className="btn btn-ghost" style={{fontSize:".78rem",padding:"6px 12px",color:"#fff",borderColor:"rgba(255,255,255,.2)"}}
+            onClick={()=>setShowSettings(true)}>
+            ⚙ Settings
+          </button>
           {contacts.length > 0 && (
             <button className="btn btn-ghost" style={{fontSize:".78rem",padding:"6px 12px",color:"#fff",borderColor:"rgba(255,255,255,.2)"}}
               onClick={()=>exportCSV(contacts)}>
@@ -954,14 +1392,20 @@ function App() {
               <div>
                 <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
                   <div className="spin" style={{width:18,height:18,border:"3px solid var(--rule)",borderTopColor:"var(--navy)",borderRadius:"50%"}} />
-                  <span style={{fontSize:".9rem"}}>Verifying {progress.done} / {progress.total} contacts…</span>
-                  <button className="btn btn-danger" style={{marginLeft:"auto",padding:"6px 14px",fontSize:".78rem"}} onClick={stopVerification}>Stop</button>
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:".9rem"}}>
+                      Verifying {progress.done + 1} / {progress.total}
+                      {progress.name ? ` — ${progress.name}` : ""}
+                    </div>
+                    {progress.stage && <div className="stage-lbl">{progress.stage}</div>}
+                  </div>
+                  <button className="btn btn-danger" style={{padding:"6px 14px",fontSize:".78rem"}} onClick={stopVerification}>Stop</button>
                 </div>
                 <div className="prog-bar-wrap">
                   <div className="prog-bar" style={{width:`${progress.total?Math.round(progress.done/progress.total*100):0}%`}} />
                 </div>
                 <div style={{fontSize:".75rem",color:"var(--muted)",marginTop:4}}>
-                  {progress.total ? Math.round(progress.done/progress.total*100) : 0}% complete
+                  {progress.total ? Math.round(progress.done/progress.total*100) : 0}% complete · ~{Math.ceil((progress.total - progress.done) * (RATE_LIMIT_MS/1000 + 5))}s remaining
                 </div>
               </div>
             ) : (
@@ -993,9 +1437,11 @@ function App() {
             )}
 
             <div className="wiz-note" style={{marginTop:14}}>
-              ℹ️ <strong>How verification works:</strong> The engine validates email format and domain, phone number format and area code, and address completeness. 
-              Photos are retrieved via avatar service (real LinkedIn/Google photo lookup requires API keys — see documentation).
-              For production use, connect a dedicated email verification API (e.g., ZeroBounce, NeverBounce) and phone lookup service (e.g., Twilio, NumVerify).
+              ℹ️ <strong>How web scraping works:</strong> Each contact is searched via{" "}
+              {apiConfig.serpApiKey ? <strong>Google (SerpAPI)</strong> : <span>DuckDuckGo (free fallback)</span>},
+              then the company website is scraped for phone/email, and LinkedIn is searched for the current headline and photo.
+              Rate limit: {RATE_LIMIT_MS/1000}s between contacts.
+              {!apiConfig.serpApiKey && <> · <button style={{background:"none",border:"none",color:"var(--navy)",textDecoration:"underline",cursor:"pointer",padding:0,font:"inherit",fontSize:".78rem"}} onClick={()=>setShowSettings(true)}>Add SerpAPI key</button> for full Google Search results.</>}
             </div>
           </div>
         )}
@@ -1132,6 +1578,15 @@ function App() {
           contact={selected}
           onClose={()=>setSelected(null)}
           onUpdate={c=>{ updateContact(c); setSelected(null); }}
+        />
+      )}
+
+      {/* Settings Panel */}
+      {showSettings && (
+        <SettingsPanel
+          apiConfig={apiConfig}
+          onSave={cfg=>{ setApiConfig(cfg); showToast("✓ API keys saved", "success"); }}
+          onClose={()=>setShowSettings(false)}
         />
       )}
 
