@@ -1115,9 +1115,9 @@ function DetailPanel({ contact, onClose, onUpdate }) {
             <span>{v.confidence}% confidence</span>
             <span style={{fontStyle:"italic"}}>
               {v.searchMethod === "format-only"
-                ? "Format validation only — add SerpAPI key for enhanced results"
+                ? "Format validation only (no web search attempted)"
                 : v.searchMethod === "searched-no-results"
-                  ? "Web searched — no public records found"
+                  ? "Web searched (DuckDuckGo + directories) — no public records found"
                   : `Verified via ${v.searchMethod}`}
             </span>
           </div>
@@ -1358,6 +1358,14 @@ function App() {
     showToast("✓ Contact saved", "success");
   }
 
+  /* ── Remove contact ── */
+  function handleDeleteContact(contact) {
+    if (!window.confirm(`Remove ${contact.name}?`)) return;
+    const next = contacts.filter(c => c.id !== contact.id);
+    setContacts(next);
+    if (sessionId) saveToFirebase(sessionId, next).catch(()=>{});
+  }
+
   /* ── Sort & Filter ── */
   const displayed = useMemo(() => {
     let list = [...contacts];
@@ -1551,7 +1559,7 @@ function App() {
                   <div className="spin" style={{width:18,height:18,border:"3px solid var(--rule)",borderTopColor:"var(--navy)",borderRadius:"50%"}} />
                   <div style={{flex:1}}>
                     <div style={{fontSize:".9rem"}}>
-                      Verifying {progress.done + 1} / {progress.total}
+                      Verifying {Math.min(progress.done + 1, progress.total)} / {progress.total}
                       {progress.name ? ` — ${progress.name}` : ""}
                     </div>
                     {progress.stage && <div className="stage-lbl">{progress.stage}</div>}
@@ -1615,6 +1623,7 @@ function App() {
               then the company website is scraped for phone/email, professional directories (Avvo / Realtor.com)
               are checked, LinkedIn is searched for the current headline and photo, and Gravatar is checked for
               a professional photo using the contact's email address.
+              Web search runs for every contact regardless of API keys; results depend on publicly available records.
               Rate limit: {RATE_LIMIT_MS/1000}s between contacts.
               {!apiConfig.serpApiKey && <> · <button style={{background:"none",border:"none",color:"var(--navy)",textDecoration:"underline",cursor:"pointer",padding:0,font:"inherit",fontSize:".78rem"}} onClick={()=>setShowSettings(true)}>Add SerpAPI key</button> for enhanced Google Search results.</>}
             </div>
@@ -1717,10 +1726,16 @@ function App() {
                               rows={2}
                             />
                           </td>
-                          <td>
+                          <td style={{whiteSpace:"nowrap"}}>
                             <button className="btn btn-ghost" style={{padding:"5px 10px",fontSize:".75rem"}}
                               onClick={()=>setSelected(c)}>
                               View →
+                            </button>
+                            <button className="btn btn-ghost" style={{padding:"5px 8px",fontSize:".75rem",color:"var(--red)",marginLeft:4}}
+                              title="Remove contact"
+                              aria-label={`Remove ${c.name}`}
+                              onClick={()=>handleDeleteContact(c)}>
+                              ✕
                             </button>
                           </td>
                         </tr>
